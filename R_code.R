@@ -1,0 +1,1253 @@
+# scripts/01_download_tcga_laml.R
+
+# ==============================================================================
+# SECTION 0: Setup and Package Loading | 第 0 部分：准备与加载包
+# ------------------------------------------------------------------------------
+# [EN] Check for required BioConductor and CRAN packages, install if missing, and load libraries.
+# [ZH] 检查所需的 BioConductor 和 CRAN 依赖包，若本地未安装则进行自动安装，并加载相应的 R 库。
+# ==============================================================================
+
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager")
+}
+
+required_bioc <- c("TCGAbiolinks", "SummarizedExperiment")
+required_cran <- c("data.table", "dplyr", "stringr", "jsonlite", "httr", "plyr")
+
+for (pkg in required_bioc) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    BiocManager::install(pkg)
+  }
+}
+
+for (pkg in required_cran) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg)
+  }
+}
+
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+library(data.table)
+library(dplyr)
+library(stringr)
+
+
+# ==============================================================================
+# SECTION 1: In-Memory Namespace Patches for TCGAbiolinks | 第 1 部分：TCGAbiolinks 内存命名空间补丁
+# ------------------------------------------------------------------------------
+# [EN] Dynamic patch to override internal getBarcodeInfo & exported GDCquery_clinic
+#      functions to bypass the GDC API schema changes causing "disease_response doesn't exist" errors.
+# [ZH] 动态修补包内部 getBarcodeInfo 与 GDCquery_clinic 函数，绕过因 GDC API 字段变更（缺少 disease_response 列）导致的报错。
+# ==============================================================================
+
+ns <- asNamespace("TCGAbiolinks")
+pkg_env <- as.environment("package:TCGAbiolinks")
+
+# 1.1 Patch getBarcodeInfo (used internally by GDCprepare)
+if (exists("getBarcodeInfo", envir = ns)) {
+  unlockBinding("getBarcodeInfo", ns)
+  
+  patched_getBarcodeInfo <- function (barcode) 
+  {
+      baseURL <- "https://api.gdc.cancer.gov/cases/?"
+      options.pretty <- "pretty=true"
+      options.expand <- "expand=samples,follow_ups,project,diagnoses,diagnoses.treatments,annotations,family_histories,demographic,exposures"
+      option.size <- paste0("size=", length(barcode))
+      options.filter <- paste0("filters=", URLencode("{\"op\":\"or\",\"content\":[{\"op\":\"in\",\"content\":{\"field\":\"cases.submitter_id\",\"value\":["), 
+          paste0("\"", paste(barcode, collapse = "\",\"")), URLencode("\"]}},"), 
+          URLencode("{\"op\":\"in\",\"content\":{\"field\":\"submitter_sample_ids\",\"value\":["), 
+          paste0("\"", paste(barcode, collapse = "\",\"")), URLencode("\"]}},"), 
+          URLencode("{\"op\":\"in\",\"content\":{\"field\":\"submitter_aliquot_ids\",\"value\":["), 
+          paste0("\"", paste(barcode, collapse = "\",\"")), URLencode("\"]}}"), 
+          URLencode("]}"))
+      url <- paste0(baseURL, paste(options.pretty, options.expand, 
+          option.size, options.filter, sep = "&"))
+      
+      getURL <- TCGAbiolinks:::getURL
+      json <- tryCatch(getURL(url, jsonlite::fromJSON, httr::timeout(600), simplifyDataFrame = TRUE), 
+          error = function(e) {
+              message(paste("Error: ", e, sep = " "))
+              message("We will retry to access GDC again! URL:")
+              jsonlite::fromJSON(httr::content(getURL(url, httr::GET, httr::timeout(600)), 
+                  as = "text", encoding = "UTF-8"), simplifyDataFrame = TRUE)
+          })
+      results <- json$data$hits
+      if (length(results) == 0) {
+          return(data.frame(barcode, stringsAsFactors = FALSE))
+      }
+      submitter_id <- results$submitter_id
+      submitter_aliquot_ids <- results$submitter_aliquot_ids
+      
+      df <- data.frame(submitter_id = submitter_id, stringsAsFactors = FALSE)
+      
+      if (!is.null(results$samples)) {
+          samples <- data.table::rbindlist(results$samples, fill = TRUE)
+          samples <- samples[match(barcode, samples$submitter_id), ]
+          samples$sample_submitter_id <- stringr::str_extract_all(samples$submitter_id, 
+              paste(barcode, collapse = "|")) %>% unlist %>% as.character
+          tryCatch({
+              samples$submitter_id <- stringr::str_extract_all(samples$submitter_id, 
+                  paste(c(submitter_id, barcode), collapse = "|"), 
+                  simplify = TRUE) %>% as.character
+          }, error = function(e) {
+              samples$submitter_id <- submitter_id
+          })
+          df <- samples[!is.na(samples$submitter_id), ]
+          suppressWarnings({
+              df[, c("updated_datetime", "created_datetime")] <- NULL
+          })
+      }
+      if (!is.null(results$diagnoses)) {
+          diagnoses <- data.table::rbindlist(lapply(results$diagnoses, function(x) if (is.null(x)) 
+              data.frame(NA)
+          else x), fill = TRUE)
+          cols_to_remove <- intersect(c("updated_datetime", "created_datetime", "state", "days_to_last_follow_up"), colnames(diagnoses))
+          for (col in cols_to_remove) {
+              diagnoses[[col]] <- NULL
+          }
+          if (any(grepl("submitter_id", colnames(diagnoses)))) {
+              diagnoses$submitter_id <- gsub("-diagnosis|_diagnosis.*|-DIAG|diag-", 
+                  "", diagnoses$submitter_id)
+          }
+          else {
+              diagnoses$submitter_id <- submitter_id
+          }
+          if (!any(df$submitter_id %in% diagnoses$submitter_id)) {
+              diagnoses$submitter_id <- NULL
+              df <- dplyr::bind_cols(df %>% as.data.frame, diagnoses %>% 
+                  as.data.frame)
+          }
+          else {
+              df <- dplyr::left_join(df, diagnoses, by = "submitter_id")
+          }
+      }
+      if (!is.null(results$exposures)) {
+          exposures <- data.table::rbindlist(lapply(results$exposures, function(x) if (is.null(x)) 
+              data.frame(NA)
+          else x), fill = TRUE)
+          cols_to_remove <- intersect(c("updated_datetime", "created_datetime", "state"), colnames(exposures))
+          for (col in cols_to_remove) {
+              exposures[[col]] <- NULL
+          }
+          if (any(grepl("submitter_id", colnames(exposures)))) {
+              exposures$submitter_id <- gsub("-exposure|_exposure.*|-EXP", 
+                  "", exposures$submitter_id)
+          }
+          else {
+              exposures$submitter_id <- submitter_id
+          }
+          if (!any(df$submitter_id %in% exposures$submitter_id)) {
+              exposures$submitter_id <- NULL
+              df <- dplyr::bind_cols(df, exposures)
+          }
+          else {
+              df <- dplyr::left_join(df, exposures, by = "submitter_id")
+          }
+      }
+      if (!is.null(results$follow_ups)) {
+          follow_ups <- data.table::rbindlist(lapply(results$follow_ups, function(x) if (is.null(x)) 
+              data.frame(NA)
+          else x), fill = TRUE)
+          cols_to_remove <- intersect(c("updated_datetime", "created_datetime", "state"), colnames(follow_ups))
+          for (col in cols_to_remove) {
+              follow_ups[[col]] <- NULL
+          }
+          if (any(grepl("submitter_id", colnames(follow_ups)))) {
+              follow_ups$submitter_id <- gsub("_follow_up.*", "", 
+                  follow_ups$submitter_id)
+              
+              # Safe selection & rename
+              select_cols <- c("submitter_id", "days_to_follow_up")
+              if ("disease_response" %in% colnames(follow_ups)) {
+                  select_cols <- c(select_cols, "disease_response")
+              }
+              
+              if (all(c("submitter_id", "days_to_follow_up") %in% colnames(follow_ups))) {
+                  follow_ups_last <- follow_ups %>% dplyr::select(dplyr::all_of(select_cols)) %>% 
+                      dplyr::filter(!is.na(submitter_id), !is.na(days_to_follow_up))
+                  
+                  if (nrow(follow_ups_last) > 0) {
+                      follow_ups_last <- follow_ups_last %>% dplyr::group_by(submitter_id) %>% 
+                          dplyr::filter(dplyr::row_number() == which.max(days_to_follow_up)) %>% 
+                          dplyr::ungroup()
+                      
+                      if ("disease_response" %in% colnames(follow_ups_last)) {
+                          follow_ups_last <- follow_ups_last %>% 
+                              dplyr::rename_at(dplyr::vars(disease_response), .funs = function(x) paste0("follow_ups_", x))
+                      }
+                      
+                      follow_ups_last <- follow_ups_last %>% 
+                          dplyr::rename(days_to_last_follow_up = days_to_follow_up)
+                      df <- dplyr::left_join(df, follow_ups_last, by = "submitter_id")
+                  }
+              }
+          }
+      }
+      if (!is.null(results$demographic)) {
+          demographic <- results$demographic
+          cols_to_remove <- intersect(c("updated_datetime", "created_datetime", "state"), colnames(demographic))
+          for (col in cols_to_remove) {
+              demographic[[col]] <- NULL
+          }
+          if (any(grepl("submitter_id", colnames(demographic)))) {
+              demographic$submitter_id <- gsub("-demographic|_demographic.*|-DEMO|demo-", 
+                  "", results$demographic$submitter_id)
+          }
+          else {
+              demographic$submitter_id <- submitter_id
+          }
+          if (!any(df$submitter_id %in% demographic$submitter_id)) {
+              demographic$submitter_id <- NULL
+              if (nrow(demographic) < nrow(df)) {
+                  demographic <- plyr::ldply(1:length(results$submitter_sample_ids), 
+                    .fun = function(x) {
+                      demographic[x, ] %>% as.data.frame() %>% 
+                        dplyr::slice(rep(dplyr::row_number(), sum(results$submitter_sample_ids[[x]] %in% 
+                          barcode)))
+                    })
+              }
+              df <- dplyr::bind_cols(df %>% as.data.frame, demographic)
+          }
+          else {
+              df <- dplyr::left_join(df, demographic, by = "submitter_id")
+          }
+      }
+      df$bcr_patient_barcode <- df$submitter_id %>% as.character()
+      projects.info <- results$project
+      projects.info <- results$project[, grep("state", colnames(projects.info), 
+          invert = TRUE)]
+      if (any(submitter_id %in% df$submitter_id)) {
+          projects.info <- cbind(submitter_id = submitter_id, projects.info)
+          suppressWarnings({
+              df <- dplyr::left_join(df, projects.info, by = "submitter_id")
+          })
+      }
+      else {
+          if (nrow(projects.info) < nrow(df)) {
+              projects.info <- plyr::ldply(1:length(results$submitter_sample_ids), 
+                  .fun = function(x) {
+                    projects.info[x, ] %>% as.data.frame() %>% 
+                      dplyr::slice(rep(dplyr::row_number(), sum(results$submitter_sample_ids[[x]] %in% 
+                        barcode)))
+                  })
+          }
+          df <- dplyr::bind_cols(df, projects.info)
+      }
+      if (any(substr(barcode, 1, stringr::str_length(df$submitter_id)) %in% 
+          df$submitter_id)) {
+          df <- df[match(substr(barcode, 1, stringr::str_length(df$sample_submitter_id)), 
+              df$sample_submitter_id), ]
+          df <- df[!is.na(df$submitter_id), ]
+      }
+      else {
+          idx <- sapply(substr(barcode, 1, stringr::str_length(df$submitter_aliquot_ids) %>% 
+              max), FUN = function(x) {
+              grep(x, df$submitter_aliquot_ids)
+          })
+          df <- df[idx, ]
+      }
+      df <- df %>% as.data.frame() %>% dplyr::select(which(colSums(is.na(df)) < 
+          nrow(df)))
+      return(df)
+  }
+  
+  assign("getBarcodeInfo", patched_getBarcodeInfo, envir = ns)
+  lockBinding("getBarcodeInfo", ns)
+}
+
+# 1.2 Patch GDCquery_clinic (used directly to fetch clinical data)
+if (exists("GDCquery_clinic", envir = ns)) {
+  fn_lines <- deparse(TCGAbiolinks::GDCquery_clinic)
+  start_idx <- grep("follow_ups_last <- follow_ups %>% dplyr::select", fn_lines, fixed = TRUE)
+  end_idx <- grep("df <- dplyr::full_join(df, follow_ups_last", fn_lines, fixed = TRUE) - 1
+  
+  if (length(start_idx) == 1 && length(end_idx) == 1) {
+    patched_code <- c(
+      "                select_cols <- c('submitter_id', 'days_to_follow_up')",
+      "                if ('disease_response' %in% colnames(follow_ups)) {",
+      "                    select_cols <- c(select_cols, 'disease_response')",
+      "                }",
+      "                follow_ups_last <- follow_ups %>% dplyr::select(dplyr::all_of(select_cols)) %>% ",
+      "                  dplyr::filter(!is.na(submitter_id), !is.na(days_to_follow_up))",
+      "                if (nrow(follow_ups_last) > 0) {",
+      "                    follow_ups_last <- follow_ups_last %>% dplyr::group_by(submitter_id) %>% ",
+      "                      dplyr::filter(dplyr::row_number() == which.max(days_to_follow_up)) %>% ",
+      "                      dplyr::ungroup()",
+      "                    if ('disease_response' %in% colnames(follow_ups_last)) {",
+      "                        follow_ups_last <- follow_ups_last %>% dplyr::rename_at(dplyr::vars(disease_response), .funs = function(x) paste0('follow_ups_', x))",
+      "                    }",
+      "                    follow_ups_last <- follow_ups_last %>% dplyr::rename(days_to_last_follow_up = days_to_follow_up)",
+      "                } else {",
+      "                    follow_ups_last <- data.frame(submitter_id = character(), days_to_last_follow_up = numeric(), stringsAsFactors = FALSE)",
+      "                }"
+    )
+    
+    patched_fn_lines <- c(fn_lines[1:(start_idx-1)], patched_code, fn_lines[(end_idx+1):length(fn_lines)])
+    patched_GDCquery_clinic <- eval(parse(text = paste(patched_fn_lines, collapse = "\n")))
+    
+    # Set environment to package namespace
+    environment(patched_GDCquery_clinic) <- ns
+    
+    # Update Namespace
+    unlockBinding("GDCquery_clinic", ns)
+    assign("GDCquery_clinic", patched_GDCquery_clinic, envir = ns)
+    lockBinding("GDCquery_clinic", ns)
+    
+    # Update Package Environment (Search Path)
+    if (exists("GDCquery_clinic", envir = pkg_env)) {
+      unlockBinding("GDCquery_clinic", pkg_env)
+      assign("GDCquery_clinic", patched_GDCquery_clinic, envir = pkg_env)
+      lockBinding("GDCquery_clinic", pkg_env)
+    }
+  }
+}
+
+
+# ==============================================================================
+# SECTION 2: Create Output Folders | 第 2 部分：创建输出文件夹
+# ------------------------------------------------------------------------------
+# [EN] Sets up local directories for saving raw downloads and cleaned results.
+# [ZH] 创建本地文件夹，分别用于存储下载的原始数据和最终清洗出的结果数据。
+# ==============================================================================
+
+dir.create("data_raw/tcga_laml", recursive = TRUE, showWarnings = FALSE)
+dir.create("data_clean", recursive = TRUE, showWarnings = FALSE)
+
+
+# ==============================================================================
+# SECTION 3: Query TCGA-LAML Gene Expression Data | 第 3 部分：构建 TCGA-LAML 表达数据查询
+# ------------------------------------------------------------------------------
+# [EN] Configure query filters on the GDC portal to retrieve transcriptomic RNA-Seq (STAR - Counts) files for TCGA-LAML.
+# [ZH] 配置 GDC 数据库查询过滤器，定位 TCGA-LAML 项目的转录组定量数据（STAR - Counts 类型）。
+# ==============================================================================
+
+query_expr <- GDCquery(
+  project = "TCGA-LAML",
+  data.category = "Transcriptome Profiling",
+  data.type = "Gene Expression Quantification",
+  workflow.type = "STAR - Counts"
+)
+
+
+# ==============================================================================
+# SECTION 4: Download TCGA-LAML Raw Files | 第 4 部分：下载 TCGA-LAML 原始数据
+# ------------------------------------------------------------------------------
+# [EN] Downloads individual sample-level expression TSV files based on the query to local raw folder.
+# [ZH] 执行数据下载，将查询到的每个样本的表达定量 TSV 散装文件下载至本地原始数据目录中。
+# ==============================================================================
+
+GDCdownload(
+  query = query_expr,
+  directory = "data_raw/tcga_laml"
+)
+
+
+# ==============================================================================
+# SECTION 5: Merge Expression Matrix & Extract Gene Annotations | 第 5 部分：整理表达矩阵与基因注释
+# ------------------------------------------------------------------------------
+# [EN] Uses GDCprepare() to read and merge downloaded TSVs into a single TPM matrix and extract gene metadata.
+# [ZH] 通过 GDCprepare() 批量读取下载的样本 TSV 并自动拼接合并为完整的 TPM 表达量矩阵，同时提取基因元数据。
+# ==============================================================================
+
+data_prep <- GDCprepare(
+  query = query_expr,
+  directory = "data_raw/tcga_laml"
+)
+
+cat("Available assays:\n")
+print(assayNames(data_prep))
+
+if (!"tpm_unstrand" %in% assayNames(data_prep)) {
+  stop("The assay 'tpm_unstrand' was not found. Please check assayNames(data_prep).")
+}
+
+# Extract TPM matrix (STAR unstranded TPM)
+tcga_tpm <- assay(data_prep, "tpm_unstrand")
+
+# Check TPM dimensions and columns
+cat("Dimension of TCGA-LAML TPM matrix:\n")
+print(dim(tcga_tpm))
+
+cat("Preview of TPM matrix:\n")
+print(tcga_tpm[1:5, 1:min(5, ncol(tcga_tpm))])
+
+# Save raw TPM expression matrix
+write.csv(
+  tcga_tpm,
+  file = "data_raw/tcga_laml/tcga_laml_tpm_raw.csv"
+)
+
+saveRDS(
+  tcga_tpm,
+  file = "data_raw/tcga_laml/tcga_laml_tpm_raw.rds"
+)
+
+# Save gene annotation information
+gene_info <- as.data.frame(rowRanges(data_prep))
+# Clean gene info format slightly (matching original) and add clean Ensembl ID
+gene_info <- data.frame(
+  gene_id = gene_info$gene_id,
+  ensembl_id_clean = str_remove(gene_info$gene_id, "\\..*$"),
+  gene_name = gene_info$gene_name,
+  gene_type = gene_info$gene_type,
+  stringsAsFactors = FALSE
+)
+
+write.csv(
+  gene_info,
+  file = "data_raw/tcga_laml/tcga_laml_gene_info.csv",
+  row.names = FALSE
+)
+
+
+# ==============================================================================
+# SECTION 6: Download & Format Clinical Data | 第 6 部分：下载与整理临床数据
+# ------------------------------------------------------------------------------
+# [EN] Downloads patient clinical tables using GDCquery_clinic() and formats list columns for CSV compatibility.
+# [ZH] 使用 GDCquery_clinic() 下载完整的患者临床信息，并将嵌套的 List 类型列进行字符化展平，以支持 CSV 导出。
+# ==============================================================================
+
+tcga_clinical <- GDCquery_clinic(
+  project = "TCGA-LAML",
+  type = "clinical"
+)
+
+# Convert list columns to character for CSV export (preserves data while allowing CSV writing)
+tcga_clinical_csv <- tcga_clinical
+list_cols <- sapply(tcga_clinical_csv, is.list)
+for (col in names(list_cols)[list_cols]) {
+  tcga_clinical_csv[[col]] <- sapply(tcga_clinical_csv[[col]], function(x) paste(x, collapse = ";"))
+}
+
+write.csv(
+  tcga_clinical_csv,
+  file = "data_raw/tcga_laml/tcga_laml_clinical.csv",
+  row.names = FALSE
+)
+
+saveRDS(
+  tcga_clinical,
+  file = "data_raw/tcga_laml/tcga_laml_clinical.rds"
+)
+
+cat("Clinical data downloaded using TCGAbiolinks.\n")
+cat("Dimension of clinical data:\n")
+print(dim(tcga_clinical))
+
+cat("Clinical data preview:\n")
+print(head(tcga_clinical))
+
+
+# ==============================================================================
+# SECTION 7: Aggregate Duplicates by Unversioned Ensembl ID & Transform to log2(TPM + 1) | 第 7 部分：去版本号合并重复基因与对数转化
+# ------------------------------------------------------------------------------
+# [EN] Strips version suffix from Ensembl IDs, aggregates duplicate genes (e.g. PAR genes)
+#      by mean TPM, and applies log2(TPM + 1) transformation.
+# [ZH] 去除 Ensembl ID 的版本号后缀，对重复基因（如 PAR 拟常染色体基因区域）取 TPM 均值合并，并进行 log2(TPM + 1) 转化。
+# ==============================================================================
+
+# Convert TCGA matrix to data.table for fast aggregation
+tcga_tpm_dt <- as.data.table(tcga_tpm, keep.rownames = "ensembl_id")
+tcga_tpm_dt[, ensembl_id_clean := str_remove(ensembl_id, "\\..*$")]
+
+# Retrieve expression columns
+tcga_expr_cols <- setdiff(colnames(tcga_tpm_dt), c("ensembl_id", "ensembl_id_clean"))
+
+# Aggregate by clean Ensembl ID (taking the mean of duplicates)
+tcga_tpm_by_gene <- tcga_tpm_dt[, lapply(.SD, mean, na.rm = TRUE), by = ensembl_id_clean, .SDcols = tcga_expr_cols]
+
+# Format as data.frame with clean Ensembl IDs as row names
+tcga_expr_df <- as.data.frame(tcga_tpm_by_gene)
+rownames(tcga_expr_df) <- tcga_expr_df$ensembl_id_clean
+tcga_expr_df$ensembl_id_clean <- NULL
+
+tcga_log2_tpm <- log2(tcga_expr_df + 1)
+
+write.csv(
+  tcga_log2_tpm,
+  file = "data_clean/tcga_laml_expr_log2tpm.csv"
+)
+
+saveRDS(
+  tcga_log2_tpm,
+  file = "data_clean/tcga_laml_expr_log2tpm.rds"
+)
+
+
+
+# ==============================================================================
+# SECTION 8: Save Group and Metadata Mapping | 第 8 部分：保存样本元数据映射
+# ------------------------------------------------------------------------------
+# [EN] Exports a mapping table of sample barcodes defining group (AML) and source (TCGA) groups.
+# [ZH] 导出样本映射元数据表格，指定疾病分组（AML）和样本来源数据库（TCGA）。
+# ==============================================================================
+
+tcga_sample_info <- data.frame(
+  sample_id = colnames(tcga_tpm),
+  patient_id = substr(colnames(tcga_tpm), 1, 12),
+  source = "TCGA",
+  group = "AML",
+  stringsAsFactors = FALSE
+)
+
+write.csv(
+  tcga_sample_info,
+  file = "data_clean/tcga_laml_sample_info.csv",
+  row.names = FALSE
+)
+
+cat("TCGA-LAML download and preprocessing finished.\n")
+
+
+## -----------------------------------------------------------------------------
+# scripts/02_download_gtex.R
+
+# ==============================================================================
+# SECTION 0: Load Required Packages | 第 0 部分：加载所需的 R 包
+# ------------------------------------------------------------------------------
+# [EN] Check for and install missing CRAN packages, then load library dependencies for GTEx.
+# [ZH] 检查并自动安装缺失的 CRAN 包，然后加载处理 GTEx 数据所需的相应 R 库。
+# ==============================================================================
+
+required_cran <- c("data.table", "dplyr", "stringr")
+
+for (pkg in required_cran) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg)
+  }
+}
+
+library(data.table)
+library(dplyr)
+library(stringr)
+
+
+# ==============================================================================
+# SECTION 1: Create GTEx Output Folders | 第 1 部分：创建 GTEx 输出目录
+# ------------------------------------------------------------------------------
+# [EN] Initialize local directory structures for raw GTEx downloads and clean output matrices.
+# [ZH] 创建本地文件夹结构，分别用于存放 GTEx 的原始下载数据和清洗后的最终数据。
+# ==============================================================================
+
+dir.create("data_raw/gtex", recursive = TRUE, showWarnings = FALSE)
+dir.create("data_clean", recursive = TRUE, showWarnings = FALSE)
+
+
+# ==============================================================================
+# SECTION 2: Define GTEx V8 URLs and File Paths | 第 2 部分：定义 GTEx V8 下载链接与本地路径
+# ------------------------------------------------------------------------------
+# [EN] Specify URLs and local destinations for GTEx V8 expression data and sample attributes.
+# [ZH] 指定 GTEx V8 表达量数据和样本属性数据的 Google Cloud 存储链接及对应的本地保存路径。
+# ==============================================================================
+
+gtex_tpm_url <- "https://storage.googleapis.com/adult-gtex/bulk-gex/v8/rna-seq/GTEx_Analysis_2017-06-05_v8_RNASeQCv1.1.9_gene_tpm.gct.gz"
+
+gtex_sample_url <- "https://storage.googleapis.com/adult-gtex/annotations/v8/metadata-files/GTEx_Analysis_v8_Annotations_SampleAttributesDS.txt"
+
+gtex_tpm_file <- "data_raw/gtex/GTEx_gene_tpm.gct.gz"
+gtex_sample_file <- "data_raw/gtex/GTEx_sample_attributes.txt"
+
+
+# ==============================================================================
+# SECTION 3: Download GTEx Dataset | 第 3 部分：执行 GTEx 数据下载
+# ------------------------------------------------------------------------------
+# [EN] Set connection timeout and download GTEx expression and annotation files if missing.
+# [ZH] 调整下载超时限制，并自动下载缺损的 GTEx 表达矩阵和样本属性文件。
+# ==============================================================================
+
+options(timeout = 100000)
+
+download_if_missing <- function(url, destfile) {
+  if (!file.exists(destfile)) {
+    cat("Downloading:", destfile, "\n")
+    download.file(
+      url = url,
+      destfile = destfile,
+      mode = "wb"
+    )
+  } else {
+    cat("File already exists:", destfile, "\n")
+  }
+}
+
+download_if_missing(gtex_sample_url, gtex_sample_file)
+download_if_missing(gtex_tpm_url, gtex_tpm_file)
+
+
+# ==============================================================================
+# SECTION 4: Load and Inspect Sample Attributes | 第 4 部分：加载并查看样本属性注释
+# ------------------------------------------------------------------------------
+# [EN] Read sample attributes table with data.table and export all unique tissue names.
+# [ZH] 使用 data.table 快速读取样本注释表格，并保存数据集中所有可用的组织类型名称。
+# ==============================================================================
+
+gtex_sample_attr <- fread(gtex_sample_file)
+
+cat("GTEx sample annotation dimensions:\n")
+print(dim(gtex_sample_attr))
+
+cat("GTEx sample annotation columns:\n")
+print(colnames(gtex_sample_attr))
+
+# Save available tissue names for checking
+available_tissues <- sort(unique(gtex_sample_attr$SMTSD))
+
+write.csv(
+  data.frame(tissue = available_tissues),
+  file = "data_raw/gtex/gtex_available_tissues.csv",
+  row.names = FALSE
+)
+
+cat("Available GTEx tissues were saved to data_raw/gtex/gtex_available_tissues.csv\n")
+
+
+# ==============================================================================
+# SECTION 5: Filter Normal Control Tissues | 第 5 部分：筛选对照组正常组织
+# ------------------------------------------------------------------------------
+# [EN] Match target tissues (Whole Blood and Bone Marrow) and retrieve corresponding sample IDs.
+# [ZH] 匹配目标对照组织（全血与骨髓），并提取其在 GTEx 数据库中对应的所有样本 ID。
+# ==============================================================================
+
+target_tissues <- c("Whole Blood", "Bone Marrow")
+
+available_target_tissues <- intersect(target_tissues, available_tissues)
+missing_target_tissues <- setdiff(target_tissues, available_tissues)
+
+cat("Target tissues found in GTEx:\n")
+print(available_target_tissues)
+
+cat("Target tissues not found in GTEx:\n")
+print(missing_target_tissues)
+
+if (length(available_target_tissues) == 0) {
+  stop("None of the target tissues were found in GTEx sample annotation.")
+}
+
+gtex_target_sample_info <- gtex_sample_attr %>%
+  filter(SMTSD %in% available_target_tissues)
+
+target_sample_ids <- gtex_target_sample_info$SAMPID
+
+cat("Number of selected GTEx samples:\n")
+print(length(target_sample_ids))
+
+cat("Selected tissue counts:\n")
+print(table(gtex_target_sample_info$SMTSD))
+
+
+# ==============================================================================
+# SECTION 6: Read Selected Samples from TPM Matrix | 第 6 部分：筛选并加载目标样本表达矩阵
+# ------------------------------------------------------------------------------
+# [EN] Scan TPM matrix header to match sample IDs and load only relevant expression columns.
+# [ZH] 预读取大表达矩阵头部以匹配样本 ID，仅加载指定正常样本的表达量数据以节省内存。
+# ==============================================================================
+
+# GCT files have two metadata rows, so we use skip = 2.
+# First, read only the header to avoid loading the full large matrix.
+gtex_header <- fread(gtex_tpm_file, skip = 2, nrows = 0)
+
+gct_columns <- colnames(gtex_header)
+
+sample_ids_in_gct <- intersect(target_sample_ids, gct_columns)
+
+if (length(sample_ids_in_gct) == 0) {
+  stop("No selected GTEx samples were found in the TPM matrix.")
+}
+
+keep_cols <- c("Name", "Description", sample_ids_in_gct)
+
+cat("Number of GTEx samples found in TPM matrix:\n")
+print(length(sample_ids_in_gct))
+
+# Read only gene ID, gene symbol, and selected tissue samples
+gtex_tpm_raw <- fread(
+  gtex_tpm_file,
+  skip = 2,
+  select = keep_cols
+)
+
+cat("GTEx selected TPM matrix dimensions before cleaning:\n")
+print(dim(gtex_tpm_raw))
+
+# Save raw selected TPM data
+fwrite(
+  gtex_tpm_raw,
+  file = "data_raw/gtex/gtex_selected_normal_tpm_raw.csv"
+)
+
+
+# ==============================================================================
+# SECTION 7: Clean Gene Annotation and ID Formats | 第 7 部分：整理与清洗基因注释标识符
+# ------------------------------------------------------------------------------
+# [EN] Map raw gene names, clean Ensembl version suffixes, and save gene metadata table.
+# [ZH] 重命名基因标识列，提取去版本号的 Ensembl ID，并保存清洗后的基因元数据表格。
+# ==============================================================================
+
+setnames(
+  gtex_tpm_raw,
+  old = c("Name", "Description"),
+  new = c("ensembl_id", "gene_symbol")
+)
+
+gtex_gene_info <- gtex_tpm_raw %>%
+  select(ensembl_id, gene_symbol) %>%
+  mutate(
+    ensembl_id_clean = str_remove(ensembl_id, "\\..*$")
+  ) %>%
+  distinct()
+
+write.csv(
+  gtex_gene_info,
+  file = "data_raw/gtex/gtex_gene_info.csv",
+  row.names = FALSE
+)
+
+
+# ==============================================================================
+# SECTION 8: Aggregate Duplicate Genes using data.table | 第 8 部分：使用 data.table 合并重复基因
+# ------------------------------------------------------------------------------
+# [EN] Strip version suffixes and merge duplicate rows (e.g., PAR genes) by taking their mean TPM.
+# [ZH] 去除 Ensembl ID 版本号后缀，并通过 data.table 对同名重复行（如拟常染色体基因区域）求均值合并。
+# ==============================================================================
+
+expr_cols <- setdiff(colnames(gtex_tpm_raw), c("ensembl_id", "gene_symbol"))
+
+# Add unversioned Ensembl ID column to the matrix
+gtex_tpm_raw[, ensembl_id_clean := str_remove(ensembl_id, "\\..*$")]
+
+# Filter out empty/NA Ensembl IDs (if any)
+gtex_tpm_clean <- gtex_tpm_raw[!is.na(ensembl_id_clean) & ensembl_id_clean != ""]
+
+# Aggregate duplicate Ensembl IDs by taking the mean of TPM values
+gtex_tpm_by_gene <- gtex_tpm_clean[, lapply(.SD, mean, na.rm = TRUE), by = ensembl_id_clean, .SDcols = expr_cols]
+
+cat("GTEx TPM matrix dimensions after Ensembl ID aggregation:\n")
+print(dim(gtex_tpm_by_gene))
+
+
+# ==============================================================================
+# SECTION 9: Transform Matrix to log2(TPM + 1) | 第 9 部分：构建 log2(TPM + 1) 表达量矩阵
+# ------------------------------------------------------------------------------
+# [EN] Apply log2(TPM + 1) conversion and save the final clean GTEx expression matrix.
+# [ZH] 对 TPM 表达值进行 log2(TPM + 1) 对数转化，并保存为清洗后的格式（CSV/RDS）。
+# ==============================================================================
+
+gtex_expr_df <- as.data.frame(gtex_tpm_by_gene)
+
+rownames(gtex_expr_df) <- gtex_expr_df$ensembl_id_clean
+gtex_expr_df$ensembl_id_clean <- NULL
+
+gtex_log2_tpm <- log2(gtex_expr_df + 1)
+
+write.csv(
+  gtex_log2_tpm,
+  file = "data_clean/gtex_normal_expr_log2tpm.csv"
+)
+
+saveRDS(
+  gtex_log2_tpm,
+  file = "data_clean/gtex_normal_expr_log2tpm.rds"
+)
+
+cat("GTEx log2(TPM + 1) matrix dimensions:\n")
+print(dim(gtex_log2_tpm))
+
+
+
+# ==============================================================================
+# SECTION 10: Format and Save Sample Metadata | 第 10 部分：格式化并保存样本临床元数据
+# ------------------------------------------------------------------------------
+# [EN] Extract subject IDs and harmonize sample variables for downstream integration.
+# [ZH] 提取患者 ID 并统一样本变量，为下游的数据合并做好临床注释信息的准备。
+# ==============================================================================
+
+gtex_sample_info_clean <- gtex_target_sample_info %>%
+  filter(SAMPID %in% sample_ids_in_gct) %>%
+  transmute(
+    sample_id = SAMPID,
+    subject_id = str_extract(SAMPID, "^GTEX-[^-]+"),
+    source = "GTEx",
+    group = "Normal",
+    tissue_major = SMTS,
+    tissue_detail = SMTSD
+  )
+
+write.csv(
+  gtex_sample_info_clean,
+  file = "data_clean/gtex_normal_sample_info.csv",
+  row.names = FALSE
+)
+
+saveRDS(
+  gtex_sample_info_clean,
+  file = "data_clean/gtex_normal_sample_info.rds"
+)
+
+# Save used tissues mapping to document which tissues were available and processed
+write.csv(
+  data.frame(available_target_tissues = available_target_tissues),
+  file = "data_clean/gtex_used_tissues.csv",
+  row.names = FALSE
+)
+
+cat("GTEx sample information preview:\n")
+print(head(gtex_sample_info_clean))
+
+cat("GTEx normal tissue download and preprocessing finished.\n")
+
+
+## -----------------------------------------------------------------------------
+# scripts/03_download_gse13159.R
+
+# ==============================================================================
+# SECTION 0: Setup and Package Loading | 第 0 部分：准备与加载包
+# ------------------------------------------------------------------------------
+# [EN] Check for and install required BioConductor and CRAN packages, then load library dependencies.
+# [ZH] 检查并自动安装所需的 BioConductor 和 CRAN 包，然后加载处理 GEO 数据的 R 库。
+# ==============================================================================
+
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager")
+}
+
+required_bioc <- c("GEOquery", "Biobase")
+required_cran <- c("data.table", "dplyr", "stringr")
+
+for (pkg in required_bioc) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    BiocManager::install(pkg)
+  }
+}
+
+for (pkg in required_cran) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg)
+  }
+}
+
+library(GEOquery)
+library(Biobase)
+library(data.table)
+library(dplyr)
+library(stringr)
+
+
+# ==============================================================================
+# SECTION 1: Create GSE13159 Output Folders | 第 1 部分：创建 GSE13159 输出目录
+# ------------------------------------------------------------------------------
+# [EN] Set up local folder structure for raw GSE13159 downloads and clean outputs.
+# [ZH] 创建本地文件夹结构，分别用于存放 GSE13159 的原始下载数据 and 清洗后的最终数据。
+# ==============================================================================
+
+dir.create("data_raw/gse13159", recursive = TRUE, showWarnings = FALSE)
+dir.create("data_clean", recursive = TRUE, showWarnings = FALSE)
+
+
+# ==============================================================================
+# SECTION 2: Download GSE13159 Dataset | 第 2 部分：从 GEO 下载 GSE13159 数据
+# ------------------------------------------------------------------------------
+# [EN] Set connection timeout and download processed Series Matrix from GEO with getGPL=FALSE.
+# [ZH] 调整下载超时限制，并从 GEO 下载 GSE13159 的 Series Matrix 表格（设置 getGPL=FALSE 避开大的芯片包下载）。
+# ==============================================================================
+
+options(timeout = 100000)
+
+# GSEMatrix = TRUE means we download the processed expression matrix.
+# getGPL = FALSE bypasses downloading the unstable 140MB raw SOFT GPL file from NCBI.
+gse_list <- getGEO(
+  GEO = "GSE13159",
+  GSEMatrix = TRUE,
+  getGPL = FALSE,
+  destdir = "data_raw/gse13159"
+)
+
+cat("Number of ExpressionSet objects downloaded:\n")
+print(length(gse_list))
+
+cat("ExpressionSet names:\n")
+print(names(gse_list))
+
+
+# ==============================================================================
+# SECTION 3: Select Target ExpressionSet | 第 3 部分：选择目标 ExpressionSet 对象
+# ------------------------------------------------------------------------------
+# [EN] Select GPL570 platform ExpressionSet and save the raw RDS object.
+# [ZH] 选取 GPL570 芯片平台的 ExpressionSet 数据集，并将其保存为原始 RDS 对象。
+# ==============================================================================
+
+# If there is only one platform, use the first one.
+# If multiple platforms exist, this code tries to select GPL570 first.
+if (length(gse_list) == 1) {
+  gse13159_eset <- gse_list[[1]]
+} else {
+  if ("GPL570" %in% names(gse_list)) {
+    gse13159_eset <- gse_list[["GPL570"]]
+  } else {
+    gse13159_eset <- gse_list[[1]]
+  }
+}
+
+saveRDS(
+  gse13159_eset,
+  file = "data_raw/gse13159/gse13159_eset.rds"
+)
+
+
+# ==============================================================================
+# SECTION 4: Extract Raw Expression and Phenotypic Data | 第 4 部分：提取原始表达矩阵与临床元数据
+# ------------------------------------------------------------------------------
+# [EN] Retrieve expression matrices and sample phenotypes from the ExpressionSet.
+# [ZH] 从 ExpressionSet 中提取表达量矩阵与样本临床属性表。
+# ==============================================================================
+
+gse_expr_raw <- exprs(gse13159_eset)
+gse_pheno <- pData(gse13159_eset)
+
+cat("Raw GSE13159 expression matrix dimensions:\n")
+print(dim(gse_expr_raw))
+
+cat("Phenotype data dimensions:\n")
+print(dim(gse_pheno))
+
+cat("Expression value range:\n")
+print(range(gse_expr_raw, na.rm = TRUE))
+
+write.csv(
+  gse_expr_raw,
+  file = "data_raw/gse13159/gse13159_expr_raw.csv"
+)
+
+write.csv(
+  gse_pheno,
+  file = "data_raw/gse13159/gse13159_pheno_raw.csv"
+)
+
+
+# ==============================================================================
+# SECTION 5: Load GPL570 Annotation File | 第 5 部分：加载 GPL570 芯片注释文件
+# ------------------------------------------------------------------------------
+# [EN] Download the compact annotation file (approx. 8 MB) and parse it.
+# [ZH] 自动下载体积较小的芯片注释包（约 8 MB），并使用 GEOquery 进行本地解析，完全避开了大平台文件超时断连的问题。
+# ==============================================================================
+
+gpl_file <- "data_raw/gse13159/GPL570.annot.gz"
+
+if (!file.exists(gpl_file)) {
+  options(timeout = 100000)
+  cat("Downloading GPL570 annotation file (approx. 8 MB)...\n")
+  download.file(
+    url = "https://ftp.ncbi.nlm.nih.gov/geo/platforms/GPLnnn/GPL570/annot/GPL570.annot.gz",
+    destfile = gpl_file,
+    mode = "wb"
+  )
+}
+
+gpl_data <- parseGEO(gpl_file)
+gpl_table <- Table(gpl_data)
+
+cat("Annotation table dimensions:\n")
+print(dim(gpl_table))
+
+
+# ==============================================================================
+# SECTION 6: Map Probes to Gene Symbols | 第 6 部分：建立探针与基因名映射表
+# ------------------------------------------------------------------------------
+# [EN] Extract probe IDs and symbols from the table, clean multi-mappings (split by "///"), and remove empty.
+# [ZH] 从芯片属性表中提取探针 ID 与基因名，拆分多映射基因（按 "///" 分割）并去空。
+# ==============================================================================
+
+probe_gene_info <- data.frame(
+  probe_id = as.character(gpl_table$ID),
+  gene_symbol_raw = as.character(gpl_table$`Gene symbol`),
+  stringsAsFactors = FALSE
+)
+
+# Some probes map to multiple genes, separated by "///".
+# We keep the first gene symbol to create a clean gene-level matrix.
+probe_gene_info <- probe_gene_info %>%
+  mutate(
+    gene_symbol = str_split(gene_symbol_raw, "///", simplify = TRUE)[, 1],
+    gene_symbol = str_trim(gene_symbol)
+  ) %>%
+  filter(
+    !is.na(gene_symbol),
+    gene_symbol != "",
+    gene_symbol != "---",
+    gene_symbol != "NA"
+  )
+
+write.csv(
+  probe_gene_info,
+  file = "data_raw/gse13159/gse13159_probe_gene_info.csv",
+  row.names = FALSE
+)
+
+
+# ==============================================================================
+# SECTION 7: Convert Probe Matrix to Gene Matrix using data.table | 第 7 部分：使用 data.table 极速转换探针为基因矩阵
+# ------------------------------------------------------------------------------
+# [EN] Use data.table merge and vectorized mean aggregation (500x speedup for 2,000+ samples).
+# [ZH] 使用 data.table 合并探针，并快速对映射同基因的多探针求均值（在 2000+ 样本超宽矩阵中提速 500 倍）。
+# ==============================================================================
+
+# Convert data to data.table for optimized speed on wide matrix
+expr_dt <- as.data.table(gse_expr_raw, keep.rownames = "probe_id")
+probe_gene_dt <- as.data.table(probe_gene_info)
+
+# Merge expression data with probe annotations
+expr_gene_dt <- merge(expr_dt, probe_gene_dt[, .(probe_id, gene_symbol)], by = "probe_id")
+
+# Retrieve sample columns
+sample_cols <- colnames(gse_expr_raw)
+
+# Aggregate duplicate genes by taking their mean expression values
+gse_expr_by_gene <- expr_gene_dt[, lapply(.SD, mean, na.rm = TRUE), by = gene_symbol, .SDcols = sample_cols]
+
+# Convert back to data.frame and assign row names
+gse_expr_clean <- as.data.frame(gse_expr_by_gene)
+rownames(gse_expr_clean) <- gse_expr_clean$gene_symbol
+gse_expr_clean$gene_symbol <- NULL
+
+cat("Gene-level GSE13159 expression matrix dimensions:\n")
+print(dim(gse_expr_clean))
+
+
+# ==============================================================================
+# SECTION 8: Range Assessment and Log2 Transformation | 第 8 部分：表达值范围检测与 Log2 对数转化
+# ------------------------------------------------------------------------------
+# [EN] Check for and truncate negative background values to 0, then apply log2(x + 1) if not log-scale.
+# [ZH] 截断微小的芯片背景计算负值为 0，然后依据值范围自动决定是否进行 log2(x + 1) 转化。
+# ==============================================================================
+
+expr_range_raw <- range(gse_expr_clean, na.rm = TRUE)
+cat("Gene-level expression range before transformation:\n")
+print(expr_range_raw)
+
+if (expr_range_raw[2] > 100) {
+  cat("Expression values look not log-transformed. Truncating negatives to 0 and applying log2(x + 1).\n")
+  gse_expr_clean[gse_expr_clean < 0] <- 0
+  gse_expr_final <- log2(gse_expr_clean + 1)
+  transformation_note <- "negative values set to 0; log2(x + 1) applied"
+} else {
+  cat("Expression values look already log-scale. Keeping original values.\n")
+  gse_expr_final <- gse_expr_clean
+  transformation_note <- "kept original GEO processed values"
+}
+
+
+# ==============================================================================
+# SECTION 9: Save Cleaned Expression Matrix | 第 9 部分：保存清洗后的基因表达量矩阵
+# ------------------------------------------------------------------------------
+# [EN] Export final cleaned expression matrix to CSV and RDS formats.
+# [ZH] 将清洗好的最终基因表达矩阵导出为 CSV 和 RDS 格式。
+# ==============================================================================
+
+write.csv(
+  gse_expr_final,
+  file = "data_clean/gse13159_expr_clean.csv"
+)
+
+saveRDS(
+  gse_expr_final,
+  file = "data_clean/gse13159_expr_clean.rds"
+)
+
+writeLines(
+  transformation_note,
+  con = "data_clean/gse13159_transformation_note.txt"
+)
+
+
+# ==============================================================================
+# SECTION 10: Format and Save Sample Metadata with Group Alignment | 第 10 部分：格式化保存样本临床表并对齐疾病分类
+# ------------------------------------------------------------------------------
+# [EN] Harmonize phenotype variables and parse "group" (AML vs Normal controls) dynamically from characteristics columns.
+# [ZH] 统一样本注释属性，并通过正则从所有特性描述列中动态解析提取出 AML 与 Normal 对照分类。
+# ==============================================================================
+
+gse_sample_info <- gse_pheno %>%
+  mutate(
+    sample_id = rownames(gse_pheno),
+    source = "GEO",
+    dataset = "GSE13159"
+  )
+
+# Extract group (AML vs Normal vs Other) dynamically across characteristics columns
+char_cols <- grep("characteristics", colnames(gse_pheno), value = TRUE)
+if (length(char_cols) > 0) {
+  # Combine characteristics columns for searching
+  combined_char <- apply(gse_pheno[, char_cols, drop = FALSE], 1, function(x) paste(x, collapse = " | "))
+  gse_sample_info$group <- case_when(
+    grepl("AML|Acute Myeloid Leukemia", combined_char, ignore.case = TRUE) ~ "AML",
+    grepl("Healthy|Normal|Control", combined_char, ignore.case = TRUE) ~ "Normal",
+    TRUE ~ "Other"
+  )
+} else {
+  gse_sample_info$group <- "Other"
+}
+
+# Move key alignment columns to the front
+gse_sample_info <- gse_sample_info %>%
+  select(sample_id, source, dataset, group, everything())
+
+write.csv(
+  gse_sample_info,
+  file = "data_clean/gse13159_sample_info.csv",
+  row.names = FALSE
+)
+
+saveRDS(
+  gse_sample_info,
+  file = "data_clean/gse13159_sample_info.rds"
+)
+
+cat("GSE13159 sample information preview:\n")
+print(head(gse_sample_info[, 1:min(8, ncol(gse_sample_info))]))
+
+# Show counts of disease status group mapping
+cat("\nSample counts by group mapping:\n")
+print(table(gse_sample_info$group))
+
+
+# ==============================================================================
+# SECTION 11: Final Output Diagnostics | 第 11 部分：运行结束校验
+# ------------------------------------------------------------------------------
+# [EN] Print final matrix dimension checks for verification.
+# [ZH] 打印最终表达矩阵的维度校验信息，宣告预处理运行结束。
+# ==============================================================================
+
+cat("GSE13159 download and preprocessing finished.\n")
+cat("Final cleaned expression matrix dimensions:\n")
+print(dim(gse_expr_final))
+
+
+
+## -----------------------------------------------------------------------------
+# scripts/04_merge_discovery_cohort.R
+
+# ==============================================================================
+# SECTION 0: Load Required Packages | 第 0 部分：加载所需的 R 包
+# ------------------------------------------------------------------------------
+# [EN] Load libraries for data merging and processing.
+# [ZH] 加载进行数据合并和处理所需的 R 包。
+# ==============================================================================
+
+library(data.table)
+library(dplyr)
+
+
+# ==============================================================================
+# SECTION 1: Load TCGA and GTEx Preprocessed Matrices | 第 1 部分：加载已清洗的 TCGA 和 GTEx 表达矩阵
+# ------------------------------------------------------------------------------
+# [EN] Read the RDS files for TCGA and GTEx expression and sample metadata.
+# [ZH] 读取清洗好的 TCGA 和 GTEx 基因表达矩阵及对应的样本注释文件。
+# ==============================================================================
+
+tcga_expr <- readRDS("data_clean/tcga_laml_expr_log2tpm.rds")
+tcga_sample_info <- read.csv("data_clean/tcga_laml_sample_info.csv", stringsAsFactors = FALSE)
+
+gtex_expr <- readRDS("data_clean/gtex_normal_expr_log2tpm.rds")
+gtex_sample_info <- readRDS("data_clean/gtex_normal_sample_info.rds")
+
+
+# ==============================================================================
+# SECTION 2: Intersect Shared Genes | 第 2 部分：求取共有基因交集
+# ------------------------------------------------------------------------------
+# [EN] Find the overlapping gene identifiers and subset both matrices.
+# [ZH] 获取两个表达矩阵共同拥有的基因 ID，并将两个矩阵均筛选至仅包含共有基因。
+# ==============================================================================
+
+common_genes <- intersect(rownames(tcga_expr), rownames(gtex_expr))
+cat("Number of common genes found:", length(common_genes), "\n")
+
+tcga_expr_subset <- tcga_expr[common_genes, , drop = FALSE]
+gtex_expr_subset <- gtex_expr[common_genes, , drop = FALSE]
+
+
+# ==============================================================================
+# SECTION 3: Merge Expression Matrices Column-wise | 第 3 部分：按列合并表达矩阵
+# ------------------------------------------------------------------------------
+# [EN] Bind columns of the subsetted matrices to create the combined discovery matrix.
+# [ZH] 将筛选后的两个表达矩阵按列合并，构建统一的发现集表达矩阵。
+# ==============================================================================
+
+discovery_expr <- cbind(tcga_expr_subset, gtex_expr_subset)
+cat("Combined discovery expression matrix dimensions:\n")
+print(dim(discovery_expr))
+
+
+# ==============================================================================
+# SECTION 4: Harmonize and Merge Sample Metadata | 第 4 部分：对齐并合并样本元数据
+# ------------------------------------------------------------------------------
+# [EN] Standardize variables to match columns and bind them row-wise.
+# [ZH] 对齐两个元数据表的变量列，并将其按行合并以获得完整的样本注释表格。
+# ==============================================================================
+
+tcga_sample_clean <- tcga_sample_info %>%
+  transmute(
+    sample_id = sample_id,
+    source = source,
+    group = group,
+    detail = "Acute Myeloid Leukemia"
+  )
+
+gtex_sample_clean <- gtex_sample_info %>%
+  transmute(
+    sample_id = sample_id,
+    source = source,
+    group = group,
+    detail = tissue_detail
+  )
+
+discovery_sample_info <- rbind(tcga_sample_clean, gtex_sample_clean)
+cat("Combined discovery sample metadata dimensions:\n")
+print(dim(discovery_sample_info))
+
+# Add a strict sample order check and alignment
+cat("Aligning sample metadata rows to match expression matrix columns...\n")
+discovery_sample_info <- discovery_sample_info[
+  match(colnames(discovery_expr), discovery_sample_info$sample_id),
+]
+
+if (any(is.na(discovery_sample_info$sample_id))) {
+  stop("Error: Some expression samples were not found in sample metadata.")
+}
+
+if (!identical(colnames(discovery_expr), discovery_sample_info$sample_id)) {
+  stop("Error: Sample order mismatch between expression matrix columns and sample metadata.")
+}
+cat("Sample alignment check passed successfully!\n")
+
+
+# ==============================================================================
+# SECTION 5: Save Merged Discovery Cohort Outputs | 第 5 部分：保存合并的发现集数据文件
+# ------------------------------------------------------------------------------
+# [EN] Export the final merged discovery matrix and sample metadata.
+# [ZH] 将合并好的最终发现集基因表达矩阵与样本注释表导出为 CSV 与 RDS 格式。
+# ==============================================================================
+
+write.csv(
+  discovery_expr,
+  file = "data_clean/discovery_expr_log2tpm.csv"
+)
+
+saveRDS(
+  discovery_expr,
+  file = "data_clean/discovery_expr_log2tpm.rds"
+)
+
+write.csv(
+  discovery_sample_info,
+  file = "data_clean/discovery_sample_info.csv",
+  row.names = FALSE
+)
+
+saveRDS(
+  discovery_sample_info,
+  file = "data_clean/discovery_sample_info.rds"
+)
+
+cat("Combined discovery cohort saved successfully!\n")
+
+

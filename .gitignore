@@ -1,0 +1,13 @@
+# Ignore raw and clean data folders (too large for GitHub)
+data_raw/
+data_clean/
+
+# Ignore R session history and workspace files
+.RData
+.Rhistory
+.Rproj.user/
+.Rdata
+
+# Ignore system files
+.DS_Store
+Thumbs.db
