@@ -135,12 +135,6 @@ degs_d_all <- degs_d_all %>%
 # Save complete table
 write.csv(degs_d_all, file = "data_clean/discovery_degs_all.csv", row.names = FALSE)
 
-# Filter discovery DEGs (adjp < 0.05, |log2FC| > 1.5)
-degs_d_sig <- degs_d_all %>%
-  filter(adj.P.Val < 0.05 & abs(logFC) > 1.5)
-
-cat("Discovery significant DEGs (|log2FC| > 1.5, adj.P < 0.05):", nrow(degs_d_sig), "\n")
-
 
 # ==============================================================================
 # SECTION 4: Differential Expression in Validation Cohort (limma) | 第 4 部分：独立验证集差异表达分析
@@ -178,205 +172,212 @@ degs_v_all <- degs_v_all %>%
 # Save complete table
 write.csv(degs_v_all, file = "data_clean/gse13159_degs_all.csv", row.names = FALSE)
 
-# Filter validation DEGs
-# Note: since the GSE13159 matrix is normalized to range [0, 1],
-# the absolute differences are small. We use |logFC| > 0.15 and adj.P < 0.05 as thresholds.
-degs_v_sig <- degs_v_all %>%
-  filter(adj.P.Val < 0.05 & abs(logFC) > 0.15)
-
-cat("Validation significant DEGs (|logFC| > 0.15, adj.P < 0.05):", nrow(degs_v_sig), "\n")
-
 
 # ==============================================================================
-# SECTION 5: Intersect Robust Biomarkers (Cross-Platform Overlap) | 第 5 部分：取交集提取稳定生物标志物
+# SECTION 5: Filtering, Overlap, and Plotting Wrapper Function | 第 5 部分：过滤、求交集与绘图函数
 # ------------------------------------------------------------------------------
-# [EN] Find genes showing consistent significant differential expression across both cohorts.
-# [ZH] 求取两个数据集显著差异基因的交集，过滤掉测序批次效应假阳性，锁定最稳定的核心靶点。
+# [EN] Define a helper function to run the filtering and plotting for a given significance threshold.
+# [ZH] 定义一个辅助函数，针对给定的显著性阈值执行过滤、交集计算及图表生成。
 # ==============================================================================
 
-cat("Intersecting DEGs to identify robust biomarkers...\n")
-
-# Make sure direction of fold-change is consistent (both up-regulated or both down-regulated)
-discovery_up <- degs_d_sig %>% filter(logFC > 0) %>% pull(gene_symbol)
-discovery_down <- degs_d_sig %>% filter(logFC < 0) %>% pull(gene_symbol)
-
-validation_up <- degs_v_sig %>% filter(logFC > 0) %>% pull(gene_symbol)
-validation_down <- degs_v_sig %>% filter(logFC < 0) %>% pull(gene_symbol)
-
-overlap_up <- intersect(discovery_up, validation_up)
-overlap_down <- intersect(discovery_down, validation_down)
-overlap_all <- c(overlap_up, overlap_down)
-
-cat("Robust Up-regulated genes (overlap):", length(overlap_up), "\n")
-cat("Robust Down-regulated genes (overlap):", length(overlap_down), "\n")
-cat("Total robust overlapping biomarkers:", length(overlap_all), "\n")
-
-# Combine results for overlapping genes
-degs_d_overlap <- degs_d_sig %>%
-  filter(gene_symbol %in% overlap_all) %>%
-  rename(logFC_discovery = logFC, adj.P.Val_discovery = adj.P.Val) %>%
-  select(ensembl_id, gene_symbol, logFC_discovery, adj.P.Val_discovery)
-
-degs_v_overlap <- degs_v_sig %>%
-  filter(gene_symbol %in% overlap_all) %>%
-  rename(logFC_validation = logFC, adj.P.Val_validation = adj.P.Val) %>%
-  select(gene_symbol, logFC_validation, adj.P.Val_validation)
-
-robust_biomarkers <- degs_d_overlap %>%
-  inner_join(degs_v_overlap, by = "gene_symbol") %>%
-  mutate(
-    direction = ifelse(gene_symbol %in% overlap_up, "Up", "Down")
-  ) %>%
-  arrange(desc(abs(logFC_discovery)))
-
-# Save robust overlapping biomarkers
-write.csv(robust_biomarkers, file = "data_clean/sig_degs_overlap.csv", row.names = FALSE)
-saveRDS(robust_biomarkers, file = "data_clean/sig_degs_overlap.rds")
-cat("Robust overlapping biomarkers saved to data_clean/sig_degs_overlap.csv / rds\n")
-
-
-# ==============================================================================
-# SECTION 6: Visualization: Volcano Plots | 第 6 部分：可视化之火山图
-# ------------------------------------------------------------------------------
-# [EN] Generate volcano plots for both discovery and validation cohorts, highlighting overlapping genes.
-# [ZH] 分别绘制发现集与验证集的火山图，并高亮标注交集共有的核心差异基因。
-# ==============================================================================
-
-cat("Generating Volcano Plots...\n")
-
-# 1. Discovery Volcano Plot
-degs_d_all <- degs_d_all %>%
-  mutate(
-    change = case_when(
-      gene_symbol %in% overlap_up ~ "Robust Up",
-      gene_symbol %in% overlap_down ~ "Robust Down",
-      adj.P.Val < 0.05 & logFC > 1.5 ~ "Discovery Up Only",
-      adj.P.Val < 0.05 & logFC < -1.5 ~ "Discovery Down Only",
-      TRUE ~ "Not Significant"
+run_filtering_and_plots <- function(adjp_thresh, logfc_d_thresh, logfc_v_thresh, suffix = "") {
+  cat("\n======================================================================\n")
+  cat("Running biological target filtering with adj.P.Val <", adjp_thresh, "...\n")
+  
+  # Define filenames
+  fn_sig_d <- paste0("data_clean/discovery_degs_sig", suffix, ".csv")
+  fn_overlap_csv <- paste0("data_clean/sig_degs_overlap", suffix, ".csv")
+  fn_overlap_rds <- paste0("data_clean/sig_degs_overlap", suffix, ".rds")
+  
+  fn_vol_d <- paste0("results/discovery_volcano", suffix, ".png")
+  fn_vol_v <- paste0("results/validation_volcano", suffix, ".png")
+  fn_heatmap <- paste0("results/heatmap_robust_degs", suffix, ".png")
+  
+  # 1. Filter Discovery significant DEGs
+  degs_d_sig <- degs_d_all %>%
+    filter(adj.P.Val < adjp_thresh & abs(logFC) > logfc_d_thresh)
+  cat("Discovery significant DEGs (|log2FC| >", logfc_d_thresh, "):", nrow(degs_d_sig), "\n")
+  write.csv(degs_d_sig, file = fn_sig_d, row.names = FALSE)
+  
+  # 2. Filter Validation significant DEGs
+  degs_v_sig <- degs_v_all %>%
+    filter(adj.P.Val < adjp_thresh & abs(logFC) > logfc_v_thresh)
+  cat("Validation significant DEGs (|logFC| >", logfc_v_thresh, "):", nrow(degs_v_sig), "\n")
+  
+  # 3. Intersect shared genes with consistent directions
+  discovery_up <- degs_d_sig %>% filter(logFC > 0) %>% pull(gene_symbol)
+  discovery_down <- degs_d_sig %>% filter(logFC < 0) %>% pull(gene_symbol)
+  
+  validation_up <- degs_v_sig %>% filter(logFC > 0) %>% pull(gene_symbol)
+  validation_down <- degs_v_sig %>% filter(logFC < 0) %>% pull(gene_symbol)
+  
+  overlap_up <- intersect(discovery_up, validation_up)
+  overlap_down <- intersect(discovery_down, validation_down)
+  overlap_all <- c(overlap_up, overlap_down)
+  
+  cat("Robust Up-regulated genes (overlap):", length(overlap_up), "\n")
+  cat("Robust Down-regulated genes (overlap):", length(overlap_down), "\n")
+  cat("Total robust overlapping biomarkers:", length(overlap_all), "\n")
+  
+  if (length(overlap_all) == 0) {
+    cat("Warning: No overlapping biomarkers found! Skipping plots.\n")
+    return(NULL)
+  }
+  
+  # Combine overlap details
+  degs_d_overlap <- degs_d_sig %>%
+    filter(gene_symbol %in% overlap_all) %>%
+    rename(logFC_discovery = logFC, adj.P.Val_discovery = adj.P.Val) %>%
+    select(ensembl_id, gene_symbol, logFC_discovery, adj.P.Val_discovery)
+  
+  degs_v_overlap <- degs_v_sig %>%
+    filter(gene_symbol %in% overlap_all) %>%
+    rename(logFC_validation = logFC, adj.P.Val_validation = adj.P.Val) %>%
+    select(gene_symbol, logFC_validation, adj.P.Val_validation)
+  
+  robust_biomarkers <- degs_d_overlap %>%
+    inner_join(degs_v_overlap, by = "gene_symbol") %>%
+    mutate(
+      direction = ifelse(gene_symbol %in% overlap_up, "Up", "Down")
+    ) %>%
+    arrange(desc(abs(logFC_discovery)))
+  
+  # Save robust overlapping biomarkers
+  write.csv(robust_biomarkers, file = fn_overlap_csv, row.names = FALSE)
+  saveRDS(robust_biomarkers, file = fn_overlap_rds)
+  
+  # 4. Generate Volcano Plots
+  # Discovery Volcano
+  temp_d <- degs_d_all %>%
+    mutate(
+      change = case_when(
+        gene_symbol %in% overlap_up ~ "Robust Up",
+        gene_symbol %in% overlap_down ~ "Robust Down",
+        adj.P.Val < adjp_thresh & logFC > logfc_d_thresh ~ "Discovery Up Only",
+        adj.P.Val < adjp_thresh & logFC < -logfc_d_thresh ~ "Discovery Down Only",
+        TRUE ~ "Not Significant"
+      )
     )
-  )
-
-# Select top 10 robust up and down genes to label
-top_up_labels <- robust_biomarkers %>% filter(direction == "Up") %>% head(10) %>% pull(gene_symbol)
-top_down_labels <- robust_biomarkers %>% filter(direction == "Down") %>% head(10) %>% pull(gene_symbol)
-label_genes_d <- degs_d_all %>% filter(gene_symbol %in% c(top_up_labels, top_down_labels))
-
-p_vol_d <- ggplot(degs_d_all, aes(x = logFC, y = -log10(adj.P.Val), color = change)) +
-  geom_point(alpha = 0.5, size = 1.5) +
-  scale_color_manual(values = c(
-    "Robust Up" = "#C00000",
-    "Robust Down" = "#2E75B6",
-    "Discovery Up Only" = "#FFC000",
-    "Discovery Down Only" = "#9BC2E6",
-    "Not Significant" = "grey"
-  )) +
-  geom_vline(xintercept = c(-1.5, 1.5), linetype = "dashed", color = "darkgrey") +
-  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "darkgrey") +
-  geom_text_repel(
-    data = label_genes_d,
-    aes(label = gene_symbol),
-    size = 3,
-    color = "black",
-    box_padding = 0.4,
-    point_padding = 0.3,
-    max.overlaps = 20
-  ) +
-  theme_bw() +
-  labs(
-    title = "Discovery Cohort (TCGA + GTEx) Volcano Plot",
-    x = "log2(Fold Change)",
-    y = "-log10(Adjusted P-Value)"
-  ) +
-  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
-
-ggsave("results/discovery_volcano.png", plot = p_vol_d, width = 8, height = 6.5, dpi = 300)
-
-# 2. Validation Volcano Plot
-degs_v_all <- degs_v_all %>%
-  mutate(
-    change = case_when(
-      gene_symbol %in% overlap_up ~ "Robust Up",
-      gene_symbol %in% overlap_down ~ "Robust Down",
-      adj.P.Val < 0.05 & logFC > 0.15 ~ "Validation Up Only",
-      adj.P.Val < 0.05 & logFC < -0.15 ~ "Validation Down Only",
-      TRUE ~ "Not Significant"
+  
+  top_up_labels <- robust_biomarkers %>% filter(direction == "Up") %>% head(10) %>% pull(gene_symbol)
+  top_down_labels <- robust_biomarkers %>% filter(direction == "Down") %>% head(10) %>% pull(gene_symbol)
+  label_genes_d <- temp_d %>% filter(gene_symbol %in% c(top_up_labels, top_down_labels))
+  
+  p_vol_d <- ggplot(temp_d, aes(x = logFC, y = -log10(adj.P.Val), color = change)) +
+    geom_point(alpha = 0.5, size = 1.5) +
+    scale_color_manual(values = c(
+      "Robust Up" = "#C00000",
+      "Robust Down" = "#2E75B6",
+      "Discovery Up Only" = "#FFC000",
+      "Discovery Down Only" = "#9BC2E6",
+      "Not Significant" = "grey"
+    )) +
+    geom_vline(xintercept = c(-logfc_d_thresh, logfc_d_thresh), linetype = "dashed", color = "darkgrey") +
+    geom_hline(yintercept = -log10(adjp_thresh), linetype = "dashed", color = "darkgrey") +
+    geom_text_repel(
+      data = label_genes_d,
+      aes(label = gene_symbol),
+      size = 3,
+      color = "black",
+      max.overlaps = 20
+    ) +
+    theme_bw() +
+    labs(
+      title = paste0("Discovery Cohort Volcano (adj.P < ", adjp_thresh, ")"),
+      x = "log2(Fold Change)",
+      y = "-log10(Adjusted P-Value)"
+    ) +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+  
+  ggsave(fn_vol_d, plot = p_vol_d, width = 8, height = 6.5, dpi = 300)
+  
+  # Validation Volcano
+  temp_v <- degs_v_all %>%
+    mutate(
+      change = case_when(
+        gene_symbol %in% overlap_up ~ "Robust Up",
+        gene_symbol %in% overlap_down ~ "Robust Down",
+        adj.P.Val < adjp_thresh & logFC > logfc_v_thresh ~ "Validation Up Only",
+        adj.P.Val < adjp_thresh & logFC < -logfc_v_thresh ~ "Validation Down Only",
+        TRUE ~ "Not Significant"
+      )
     )
+  
+  label_genes_v <- temp_v %>% filter(gene_symbol %in% c(top_up_labels, top_down_labels))
+  
+  p_vol_v <- ggplot(temp_v, aes(x = logFC, y = -log10(adj.P.Val), color = change)) +
+    geom_point(alpha = 0.5, size = 1.5) +
+    scale_color_manual(values = c(
+      "Robust Up" = "#C00000",
+      "Robust Down" = "#2E75B6",
+      "Validation Up Only" = "#FFC000",
+      "Validation Down Only" = "#9BC2E6",
+      "Not Significant" = "grey"
+    )) +
+    geom_vline(xintercept = c(-logfc_v_thresh, logfc_v_thresh), linetype = "dashed", color = "darkgrey") +
+    geom_hline(yintercept = -log10(adjp_thresh), linetype = "dashed", color = "darkgrey") +
+    geom_text_repel(
+      data = label_genes_v,
+      aes(label = gene_symbol),
+      size = 3,
+      color = "black",
+      max.overlaps = 20
+    ) +
+    theme_bw() +
+    labs(
+      title = paste0("Validation Cohort Volcano (adj.P < ", adjp_thresh, ")"),
+      x = "logFC",
+      y = "-log10(Adjusted P-Value)"
+    ) +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+  
+  ggsave(fn_vol_v, plot = p_vol_v, width = 8, height = 6.5, dpi = 300)
+  
+  # 5. Generate Heatmap of top 50 overlapping genes
+  top50_overlap <- robust_biomarkers %>% head(50)
+  top50_expr_d <- discovery_expr[top50_overlap$ensembl_id, ]
+  rownames(top50_expr_d) <- top50_overlap$gene_symbol
+  
+  sample_annot <- data.frame(
+    Group = discovery_sample_info$group,
+    Source = discovery_sample_info$source,
+    row.names = discovery_sample_info$sample_id
   )
-
-label_genes_v <- degs_v_all %>% filter(gene_symbol %in% c(top_up_labels, top_down_labels))
-
-p_vol_v <- ggplot(degs_v_all, aes(x = logFC, y = -log10(adj.P.Val), color = change)) +
-  geom_point(alpha = 0.5, size = 1.5) +
-  scale_color_manual(values = c(
-    "Robust Up" = "#C00000",
-    "Robust Down" = "#2E75B6",
-    "Validation Up Only" = "#FFC000",
-    "Validation Down Only" = "#9BC2E6",
-    "Not Significant" = "grey"
-  )) +
-  geom_vline(xintercept = c(-0.15, 0.15), linetype = "dashed", color = "darkgrey") +
-  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "darkgrey") +
-  geom_text_repel(
-    data = label_genes_v,
-    aes(label = gene_symbol),
-    size = 3,
-    color = "black",
-    box_padding = 0.4,
-    point_padding = 0.3,
-    max.overlaps = 20
-  ) +
-  theme_bw() +
-  labs(
-    title = "Validation Cohort (GSE13159) Volcano Plot",
-    x = "logFC",
-    y = "-log10(Adjusted P-Value)"
-  ) +
-  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
-
-ggsave("results/validation_volcano.png", plot = p_vol_v, width = 8, height = 6.5, dpi = 300)
-cat("Volcano plots saved successfully!\n")
+  
+  annot_colors <- list(
+    Group = c("Normal" = "#2E75B6", "AML" = "#C00000"),
+    Source = c("TCGA" = "#ED7D31", "GTEx" = "#70AD47")
+  )
+  
+  pheatmap(
+    top50_expr_d,
+    scale = "row",
+    annotation_col = sample_annot,
+    annotation_colors = annot_colors,
+    show_colnames = FALSE,
+    show_rownames = TRUE,
+    fontsize_row = 7,
+    cluster_cols = TRUE,
+    cluster_rows = TRUE,
+    filename = fn_heatmap,
+    width = 10,
+    height = 8
+  )
+  cat("Outputs for threshold", adjp_thresh, "saved successfully.\n")
+}
 
 
 # ==============================================================================
-# SECTION 8: Visualization: Heatmap of Robust Overlapping Genes | 第 8 部分：可视化之共有差异基因热图
+# SECTION 6: Execute Runs for Both Thresholds | 第 6 部分：执行双阈值分析运行
 # ------------------------------------------------------------------------------
-# [EN] Generate heatmap for the top 50 robust overlapping genes across discovery samples.
-# [ZH] 在发现集样本中绘制 Top 50 个共有稳定差异基因的表达分化热图。
+# [EN] Run the pipeline for both adj.P.Val < 0.05 and adj.P.Val < 0.01.
+# [ZH] 分别针对 adj.P.Val < 0.05（常规）与 adj.P.Val < 0.01（缩紧/高显著）运行分析。
 # ==============================================================================
 
-cat("Generating Heatmap...\n")
-# Select top 50 robust biomarkers ordered by significance in discovery
-top50_overlap <- robust_biomarkers %>% head(50)
-top50_expr_d <- discovery_expr[top50_overlap$ensembl_id, ]
-rownames(top50_expr_d) <- top50_overlap$gene_symbol
+# Run 1: Conventional threshold (adj.P.Val < 0.05, Discovery |log2FC| > 1.5, Validation |logFC| > 0.15)
+run_filtering_and_plots(adjp_thresh = 0.05, logfc_d_thresh = 1.5, logfc_v_thresh = 0.15, suffix = "")
 
-# Create annotation
-sample_annot <- data.frame(
-  Group = discovery_sample_info$group,
-  Source = discovery_sample_info$source,
-  row.names = discovery_sample_info$sample_id
-)
+# Run 2: Stringent threshold (adj.P.Val < 0.01, Discovery |log2FC| > 1.5, Validation |logFC| > 0.15)
+run_filtering_and_plots(adjp_thresh = 0.01, logfc_d_thresh = 1.5, logfc_v_thresh = 0.15, suffix = "_p01")
 
-annot_colors <- list(
-  Group = c("Normal" = "#2E75B6", "AML" = "#C00000"),
-  Source = c("TCGA" = "#ED7D31", "GTEx" = "#70AD47")
-)
-
-# Plot Heatmap
-pheatmap(
-  top50_expr_d,
-  scale = "row",
-  annotation_col = sample_annot,
-  annotation_colors = annot_colors,
-  show_colnames = FALSE,
-  show_rownames = TRUE,
-  fontsize_row = 7,
-  cluster_cols = TRUE,
-  cluster_rows = TRUE,
-  filename = "results/heatmap_robust_degs.png",
-  width = 10,
-  height = 8
-)
-cat("Heatmap saved to results/heatmap_robust_degs.png\n")
-
-cat("Differential expression analysis completed successfully!\n")
+cat("Differential expression analysis completed successfully for all thresholds!\n")
