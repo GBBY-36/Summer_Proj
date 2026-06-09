@@ -1,3 +1,8 @@
+## ----setup, include=FALSE-----------------------------------------------------
+knitr::opts_chunk$set(echo = TRUE)
+
+
+## -----------------------------------------------------------------------------
 # scripts/01_download_tcga_laml.R
 
 # ==============================================================================
@@ -12,7 +17,7 @@ if (!requireNamespace("BiocManager", quietly = TRUE)) {
 }
 
 required_bioc <- c("TCGAbiolinks", "SummarizedExperiment")
-required_cran <- c("data.table", "dplyr", "stringr", "jsonlite", "httr", "plyr")
+required_cran <- c("data.table", "dplyr", "stringr")
 
 for (pkg in required_bioc) {
   if (!requireNamespace(pkg, quietly = TRUE)) {
@@ -355,13 +360,6 @@ data_prep <- GDCprepare(
   directory = "data_raw/tcga_laml"
 )
 
-cat("Available assays:\n")
-print(assayNames(data_prep))
-
-if (!"tpm_unstrand" %in% assayNames(data_prep)) {
-  stop("The assay 'tpm_unstrand' was not found. Please check assayNames(data_prep).")
-}
-
 # Extract TPM matrix (STAR unstranded TPM)
 tcga_tpm <- assay(data_prep, "tpm_unstrand")
 
@@ -385,10 +383,9 @@ saveRDS(
 
 # Save gene annotation information
 gene_info <- as.data.frame(rowRanges(data_prep))
-# Clean gene info format slightly (matching original) and add clean Ensembl ID
+# Clean gene info format slightly (matching original)
 gene_info <- data.frame(
   gene_id = gene_info$gene_id,
-  ensembl_id_clean = str_remove(gene_info$gene_id, "\\..*$"),
   gene_name = gene_info$gene_name,
   gene_type = gene_info$gene_type,
   stringsAsFactors = FALSE
@@ -485,10 +482,8 @@ saveRDS(
 
 tcga_sample_info <- data.frame(
   sample_id = colnames(tcga_tpm),
-  patient_id = substr(colnames(tcga_tpm), 1, 12),
   source = "TCGA",
-  group = "AML",
-  stringsAsFactors = FALSE
+  group = "AML"
 )
 
 write.csv(
