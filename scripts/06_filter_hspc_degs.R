@@ -287,4 +287,146 @@ p_hspc <- ggplot(plot_df, aes(x = gene_symbol, y = plot_expr, fill = hspc_status
 ggsave("results/hspc_expression_up_degs.png", plot = p_hspc, width = 7.5, height = 6, dpi = 300)
 cat("Diagnostic plot saved to results/hspc_expression_up_degs.png\n")
 
-cat("\nPipeline script 06 completed successfully!\n")
+
+# ==============================================================================
+# SECTION 8: Generate Safety-Filtered Volcano Plots and Heatmap | 第 8 部分：生成安全过滤后的火山图与热图
+# ==============================================================================
+
+cat("\nGenerating safety-filtered Volcano Plots and Heatmap...\n")
+library(ggrepel)
+library(pheatmap)
+
+final_up <- degs_filtered %>% filter(direction == "Up") %>% pull(gene_symbol)
+final_down <- degs_filtered %>% filter(direction == "Down") %>% pull(gene_symbol)
+
+# Load full differential expression lists
+degs_d_all <- fread("data_clean/discovery_degs_all.csv")
+degs_v_all <- fread("data_clean/gse13159_degs_all.csv")
+
+# 1. Discovery Volcano Plot (Filtered)
+cat("Saving results/discovery_volcano_hspc_filtered.png...\n")
+temp_d <- degs_d_all %>%
+  mutate(
+    change = case_when(
+      adj.P.Val < 0.01 & logFC > 1.5 & gene_symbol %in% final_up ~ "Final Robust Up",
+      adj.P.Val < 0.01 & logFC < -1.5 & gene_symbol %in% final_down ~ "Final Robust Down",
+      adj.P.Val < 0.01 & logFC > 1.5 ~ "Discovery Up Only",
+      adj.P.Val < 0.01 & logFC < -1.5 ~ "Discovery Down Only",
+      TRUE ~ "Not Significant"
+    )
+  )
+
+top_up_labels <- degs_filtered %>% filter(direction == "Up") %>% arrange(desc(logFC_discovery)) %>% head(10) %>% pull(gene_symbol)
+top_down_labels <- degs_filtered %>% filter(direction == "Down") %>% arrange(logFC_discovery) %>% head(10) %>% pull(gene_symbol)
+label_genes_d <- temp_d %>% filter(gene_symbol %in% c(top_up_labels, top_down_labels))
+
+p_vol_d <- ggplot(temp_d, aes(x = logFC, y = -log10(adj.P.Val), color = change)) +
+  geom_point(alpha = 0.5, size = 1.5) +
+  scale_color_manual(values = c(
+    "Final Robust Up" = "#C00000",
+    "Final Robust Down" = "#2E75B6",
+    "Discovery Up Only" = "#FFC000",
+    "Discovery Down Only" = "#9BC2E6",
+    "Not Significant" = "grey"
+  )) +
+  geom_vline(xintercept = c(-1.5, 1.5), linetype = "dashed", color = "darkgrey") +
+  geom_hline(yintercept = -log10(0.01), linetype = "dashed", color = "darkgrey") +
+  geom_text_repel(
+    data = label_genes_d,
+    aes(label = gene_symbol),
+    size = 3,
+    color = "black",
+    max.overlaps = 20
+  ) +
+  theme_bw() +
+  labs(
+    title = "Discovery Cohort Volcano (Safety Filtered, adj.P < 0.01)",
+    x = "log2FC",
+    y = "-log10(Adjusted P-Value)"
+  ) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+ggsave("results/discovery_volcano_hspc_filtered.png", plot = p_vol_d, width = 8, height = 6.5, dpi = 300)
+
+# 2. Validation Volcano Plot (Filtered)
+cat("Saving results/validation_volcano_hspc_filtered.png...\n")
+temp_v <- degs_v_all %>%
+  mutate(
+    change = case_when(
+      adj.P.Val < 0.01 & logFC > 0.15 & gene_symbol %in% final_up ~ "Final Robust Up",
+      adj.P.Val < 0.01 & logFC < -0.15 & gene_symbol %in% final_down ~ "Final Robust Down",
+      adj.P.Val < 0.01 & logFC > 0.15 ~ "Validation Up Only",
+      adj.P.Val < 0.01 & logFC < -0.15 ~ "Validation Down Only",
+      TRUE ~ "Not Significant"
+    )
+  )
+
+label_genes_v <- temp_v %>% filter(gene_symbol %in% c(top_up_labels, top_down_labels))
+
+p_vol_v <- ggplot(temp_v, aes(x = logFC, y = -log10(adj.P.Val), color = change)) +
+  geom_point(alpha = 0.5, size = 1.5) +
+  scale_color_manual(values = c(
+    "Final Robust Up" = "#C00000",
+    "Final Robust Down" = "#2E75B6",
+    "Validation Up Only" = "#FFC000",
+    "Validation Down Only" = "#9BC2E6",
+    "Not Significant" = "grey"
+  )) +
+  geom_vline(xintercept = c(-0.15, 0.15), linetype = "dashed", color = "darkgrey") +
+  geom_hline(yintercept = -log10(0.01), linetype = "dashed", color = "darkgrey") +
+  geom_text_repel(
+    data = label_genes_v,
+    aes(label = gene_symbol),
+    size = 3,
+    color = "black",
+    max.overlaps = 20
+  ) +
+  theme_bw() +
+  labs(
+    title = "Validation Cohort Volcano (Safety Filtered, adj.P < 0.01)",
+    x = "logFC",
+    y = "-log10(Adjusted P-Value)"
+  ) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+ggsave("results/validation_volcano_hspc_filtered.png", plot = p_vol_v, width = 8, height = 6.5, dpi = 300)
+
+# 3. Discovery Heatmap (Filtered)
+cat("Saving results/heatmap_hspc_filtered.png...\n")
+discovery_expr <- readRDS("data_clean/discovery_expr_log2tpm.rds")
+discovery_sample_info <- readRDS("data_clean/discovery_sample_info.rds")
+
+top50_filtered <- degs_filtered %>%
+  arrange(desc(abs(logFC_discovery))) %>%
+  head(50)
+
+top50_expr_d <- discovery_expr[top50_filtered$ensembl_id, ]
+rownames(top50_expr_d) <- top50_filtered$gene_symbol
+
+sample_annot <- data.frame(
+  Group = discovery_sample_info$group,
+  Source = discovery_sample_info$source,
+  row.names = discovery_sample_info$sample_id
+)
+
+annot_colors <- list(
+  Group = c("Normal" = "#2E75B6", "AML" = "#C00000"),
+  Source = c("TCGA" = "#ED7D31", "GTEx" = "#70AD47")
+)
+
+pheatmap(
+  top50_expr_d,
+  scale = "row",
+  annotation_col = sample_annot,
+  annotation_colors = annot_colors,
+  show_colnames = FALSE,
+  show_rownames = TRUE,
+  fontsize_row = 7,
+  cluster_cols = TRUE,
+  cluster_rows = TRUE,
+  filename = "results/heatmap_hspc_filtered.png",
+  width = 10,
+  height = 8
+)
+
+cat("\nPipeline script 06 completed successfully with final safety-filtered plots!\n")
