@@ -121,6 +121,9 @@ merged_data <- group_df %>%
 
 cat("Samples aligned with expression grouping and survival data:", nrow(merged_data), "\n")
 
+# Rename hyphens to underscores in column names to prevent R formula parsing errors (e.g. for NKX2-3)
+colnames(merged_data) <- gsub("-", "_", colnames(merged_data))
+
 
 # ==============================================================================
 # SECTION 4: Perform Kaplan-Meier & Log-rank Test | 第 4 部分：执行 Kaplan-Meier 和 Log-rank 检验
@@ -141,8 +144,8 @@ genes_list <- setdiff(colnames(merged_data), c("sample_id", "patient_id", "time"
 for (gene in genes_list) {
   # Perform log-rank test
   # Formula: Surv(time, event) ~ gene_group
-  # Wrap the gene in backticks to prevent syntax errors due to hyphens in gene symbols (e.g. NKX2-3)
-  formula_str <- paste0("Surv(time, event) ~ ", "`", gene, "`")
+  # No backticks needed since hyphens are replaced by underscores
+  formula_str <- paste0("Surv(time, event) ~ ", gene)
   fit_diff <- tryCatch({
     survdiff(as.formula(formula_str), data = merged_data)
   }, error = function(e) {
@@ -155,8 +158,11 @@ for (gene in genes_list) {
   df <- length(fit_diff$n) - 1
   p_val <- pchisq(fit_diff$chisq, df = df, lower.tail = FALSE)
   
+  # Map name back to original symbol with hyphen for storage
+  orig_symbol <- gsub("_", "-", gene)
+  
   logrank_results[[gene]] <- data.frame(
-    gene_symbol = gene,
+    gene_symbol = orig_symbol,
     chisq = fit_diff$chisq,
     p_value = p_val,
     stringsAsFactors = FALSE
@@ -196,7 +202,7 @@ for (gene in genes_list) {
   # Set the reference group to 'Low' so HR represents High vs Low
   merged_data[[gene]] <- factor(merged_data[[gene]], levels = c("Low", "High"))
   
-  formula_str <- paste0("Surv(time, event) ~ ", "`", gene, "`")
+  formula_str <- paste0("Surv(time, event) ~ ", gene)
   
   fit_cox <- tryCatch({
     coxph(as.formula(formula_str), data = merged_data)
@@ -215,8 +221,11 @@ for (gene in genes_list) {
   ci_lower <- conf_info[1, "lower .95"]
   ci_upper <- conf_info[1, "upper .95"]
   
+  # Map name back to original symbol with hyphen for storage
+  orig_symbol <- gsub("_", "-", gene)
+  
   cox_results[[gene]] <- data.frame(
-    gene_symbol = gene,
+    gene_symbol = orig_symbol,
     coef = coef_info[1, "coef"],
     HR = hr_val,
     HR_CI_lower = ci_lower,
@@ -268,3 +277,111 @@ cat("  - survival_cox_results.csv / .rds\n")
 cat("  - survival_cox_sig_danger_genes.csv\n")
 
 
+# ==============================================================================
+# SECTION 7: Generate Diagnostic Visualizations | 第 7 部分：生成诊断可视化图表
+# ------------------------------------------------------------------------------
+# [EN] Generate Forest Plot for all 13 significant hazard genes, and generate
+#      Kaplan-Meier survival curves for the top 4 representative genes.
+# [ZH] 生成 13 个显著高危基因的森林图，并生成前 4 个代表性基因的 Kaplan-Meier 生存曲线合并图。
+# ==============================================================================
+
+library(ggplot2)
+
+# 1. Forest Plot for Univariate Cox results
+cat("\nGenerating Forest Plot...\n")
+plot_forest_df <- cox_filtered_df %>%
+  arrange(HR) %>%
+  mutate(gene_symbol = factor(gene_symbol, levels = gene_symbol))
+
+p_forest <- ggplot(plot_forest_df, aes(x = HR, y = gene_symbol)) +
+  geom_vline(xintercept = 1.0, linetype = "dashed", color = "darkgrey", linewidth = 0.8) +
+  geom_errorbarh(aes(xmin = HR_CI_lower, xmax = HR_CI_upper), height = 0.2, color = "black", linewidth = 0.8) +
+  geom_point(color = "#C00000", size = 3.5) +
+  theme_bw(base_size = 12) +
+  labs(
+    title = "Forest Plot of Prognostic Hazard Genes in AML",
+    subtitle = "Univariate Cox regression (HR > 1.5 & P < 0.05)",
+    x = "Hazard Ratio (HR) and 95% Confidence Interval",
+    y = "Gene Symbol"
+  ) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5, face = "italic", color = "grey30"),
+    panel.grid.minor = element_blank()
+  )
+
+ggsave("results/forest_plot_prognostic_genes.png", plot = p_forest, width = 7.5, height = 5.5, dpi = 300)
+cat("Forest Plot saved to results/forest_plot_prognostic_genes.png\n")
+
+# 2. Kaplan-Meier survival curves panel
+cat("Generating KM survival curves for 4 representative genes...\n")
+library(survminer)
+
+target_genes <- c("IL1R2", "SLC15A3", "NKX2-3", "IL3RA")
+plots_list <- list()
+
+for (gene in target_genes) {
+  # Clean name for formula (hyphen replaced by underscore)
+  col_gene <- gsub("-", "_", gene)
+  
+  formula_str <- paste0("Surv(time, event) ~ ", col_gene)
+  fit_gene <- survfit(as.formula(formula_str), data = merged_data)
+  
+  # Calculate exact p-value for display
+  fit_diff <- survdiff(as.formula(formula_str), data = merged_data)
+  df <- length(fit_diff$n) - 1
+  p_val <- pchisq(fit_diff$chisq, df = df, lower.tail = FALSE)
+  p_text <- ifelse(p_val < 0.001, "P < 0.001", paste0("P = ", round(p_val, 4)))
+  
+  p_km <- ggsurvplot(
+    fit_gene,
+    data = merged_data,
+    palette = c("#2E75B6", "#C00000"), # Blue for Low, Red for High
+    legend.labs = c("Low", "High"),
+    legend.title = paste0(gene, " level"),
+    title = paste0("Overall Survival: ", gene),
+    pval = p_text,
+    pval.coord = c(0, 0.1),
+    ggtheme = theme_bw(base_size = 9),
+    xlab = "Survival Time (Days)",
+    ylab = "Survival Probability",
+    risk.table = TRUE,
+    risk.table.y.text = FALSE,
+    risk.table.height = 0.23,
+    tables.theme = theme_cleantable()
+  )
+  
+  plots_list[[gene]] <- p_km
+}
+
+# Arrange the 4 ggsurvplots in a 2x2 grid
+res_grid <- arrange_ggsurvplots(
+  plots_list,
+  print = FALSE,
+  ncol = 2,
+  nrow = 2
+)
+
+# Save the combined grid to PNG
+ggsave("results/km_curves_top_genes.png", plot = res_grid, width = 11, height = 9, dpi = 300)
+cat("KM curves saved to results/km_curves_top_genes.png\n")
+
+
+# ==============================================================================
+# SECTION 8: Create Week4 Folder and Copy Final Outputs | 第 8 部分：创建 Week4 目录并拷贝归档
+# ==============================================================================
+
+cat("\nCreating Week4 directory and copying final outputs...\n")
+dir.create("Week4", recursive = TRUE, showWarnings = FALSE)
+
+# Copy files
+file.copy("data_clean/survival_cox_sig_danger_genes.csv", "Week4/sig_degs_survival_filtered.csv", overwrite = TRUE)
+file.copy("results/forest_plot_prognostic_genes.png", "Week4/forest_plot_prognostic_genes.png", overwrite = TRUE)
+file.copy("results/km_curves_top_genes.png", "Week4/km_curves_top_genes.png", overwrite = TRUE)
+
+cat("Successfully copied final outputs to Week4/:\n")
+cat("  - Week4/sig_degs_survival_filtered.csv\n")
+cat("  - Week4/forest_plot_prognostic_genes.png\n")
+cat("  - Week4/km_curves_top_genes.png\n")
+
+cat("\nPipeline script 07 completed successfully!\n")
