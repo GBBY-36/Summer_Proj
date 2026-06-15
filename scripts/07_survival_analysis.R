@@ -83,6 +83,122 @@ print(group_df[1:5, 1:6])
 write.csv(group_df, file = "data_clean/tcga_laml_gene_groups.csv", row.names = FALSE)
 saveRDS(group_df, file = "data_clean/tcga_laml_gene_groups.rds")
 
-cat("\nGrouping completed successfully! Saved output files:\n")
-cat("  - data_clean/tcga_laml_gene_groups.csv\n")
-cat("  - data_clean/tcga_laml_gene_groups.rds\n")
+
+# ==============================================================================
+# SECTION 3: Load Survival Data and Merge | 第 3 部分：加载生存数据并合并
+# ------------------------------------------------------------------------------
+# [EN] Load TCGA-LAML clinical database, calculate overall survival time and status,
+#      and merge with the expression-based High/Low grouping results.
+# [ZH] 加载 TCGA-LAML 临床生存数据，计算生存时间与生存状态，并与高/低表达分组结果合并。
+# ==============================================================================
+
+cat("\nLoading clinical survival data...\n")
+clinical_file <- "data_raw/tcga_laml/tcga_laml_clinical.rds"
+if (!file.exists(clinical_file)) {
+  stop("Clinical data file 'data_raw/tcga_laml/tcga_laml_clinical.rds' not found. Please run scripts/01_download_tcga_laml.R first.")
+}
+tcga_clinical <- readRDS(clinical_file)
+
+# Prepare clean survival metrics
+# time: days_to_death if dead, days_to_last_follow_up if alive
+# event: 1 if dead, 0 if alive
+clinical_survival <- tcga_clinical %>%
+  mutate(
+    patient_id = submitter_id,
+    time = ifelse(vital_status == "Dead", days_to_death, days_to_last_follow_up),
+    event = ifelse(vital_status == "Dead", 1, 0)
+  ) %>%
+  filter(!is.na(time) & time > 0) %>%
+  select(patient_id, time, event)
+
+cat("Valid clinical records with survival info:", nrow(clinical_survival), "\n")
+
+# Merge grouping results with survival metadata
+# group_df has sample_id; we map to patient_id via tcga_sample_info
+merged_data <- group_df %>%
+  inner_join(tcga_sample_info[, c("sample_id", "patient_id")], by = "sample_id") %>%
+  inner_join(clinical_survival, by = "patient_id")
+
+cat("Samples aligned with expression grouping and survival data:", nrow(merged_data), "\n")
+
+
+# ==============================================================================
+# SECTION 4: Perform Kaplan-Meier & Log-rank Test | 第 4 部分：执行 Kaplan-Meier 和 Log-rank 检验
+# ------------------------------------------------------------------------------
+# [EN] For each of the 106 genes, run the Log-rank test (survdiff) to evaluate
+#      whether there is a significant difference in survival between High and Low groups.
+# [ZH] 针对 106 个基因，逐一进行 Log-rank 检验，分析高/低表达组之间是否存在显著的生存时间差异。
+# ==============================================================================
+
+library(survival)
+
+cat("Running Log-rank tests for 106 safety-filtered genes...\n")
+logrank_results <- list()
+
+# Get the list of gene symbols (columns in merged_data, excluding sample_id, patient_id, time, event)
+genes_list <- setdiff(colnames(merged_data), c("sample_id", "patient_id", "time", "event"))
+
+for (gene in genes_list) {
+  # Perform log-rank test
+  # Formula: Surv(time, event) ~ gene_group
+  # Wrap the gene in backticks to prevent syntax errors due to hyphens in gene symbols (e.g. NKX2-3)
+  formula_str <- paste0("Surv(time, event) ~ ", "`", gene, "`")
+  fit_diff <- tryCatch({
+    survdiff(as.formula(formula_str), data = merged_data)
+  }, error = function(e) {
+    NULL
+  })
+  
+  if (is.null(fit_diff)) next
+  
+  # Calculate p-value from Chi-square statistic
+  df <- length(fit_diff$n) - 1
+  p_val <- pchisq(fit_diff$chisq, df = df, lower.tail = FALSE)
+  
+  logrank_results[[gene]] <- data.frame(
+    gene_symbol = gene,
+    chisq = fit_diff$chisq,
+    p_value = p_val,
+    stringsAsFactors = FALSE
+  )
+}
+
+# Bind list to dataframe and sort by p-value
+logrank_df <- do.call(rbind, logrank_results) %>%
+  arrange(p_value)
+
+# Classify significance
+logrank_df <- logrank_df %>%
+  mutate(
+    significance = ifelse(p_value < 0.05, "Significant", "Not Significant")
+  )
+
+cat("Log-rank analysis completed!\n")
+cat("Total genes analyzed:", nrow(logrank_df), "\n")
+cat("Significant prognostic genes (P < 0.05):", sum(logrank_df$p_value < 0.05), "\n")
+
+cat("\nTop 10 most prognostic genes by Log-rank P-value:\n")
+print(head(logrank_df, 10))
+
+
+# ==============================================================================
+# SECTION 5: Save Grouping and Log-rank Results | 第 5 部分：保存分组与 Log-rank 结果
+# ==============================================================================
+
+# Save grouping result
+write.csv(group_df, file = "data_clean/tcga_laml_gene_groups.csv", row.names = FALSE)
+saveRDS(group_df, file = "data_clean/tcga_laml_gene_groups.rds")
+
+# Save Log-rank stats
+write.csv(logrank_df, file = "data_clean/survival_logrank_results.csv", row.names = FALSE)
+saveRDS(logrank_df, file = "data_clean/survival_logrank_results.rds")
+
+# Extract and save significant genes
+sig_genes_df <- logrank_df %>% filter(p_value < 0.05)
+write.csv(sig_genes_df, file = "data_clean/survival_logrank_sig_genes.csv", row.names = FALSE)
+
+cat("\nSaved output files in data_clean/:\n")
+cat("  - tcga_laml_gene_groups.csv / .rds\n")
+cat("  - survival_logrank_results.csv / .rds\n")
+cat("  - survival_logrank_sig_genes.csv\n")
+
