@@ -182,7 +182,68 @@ print(head(logrank_df, 10))
 
 
 # ==============================================================================
-# SECTION 5: Save Grouping and Log-rank Results | 第 5 部分：保存分组与 Log-rank 结果
+# SECTION 5: Perform Univariate Cox Regression | 第 5 部分：执行单变量 Cox 回归分析
+# ------------------------------------------------------------------------------
+# [EN] Fit a univariate Cox proportional hazards regression model for each gene.
+#      Evaluate the Hazard Ratio (HR) of High vs Low expression group.
+# [ZH] 针对 106 个基因，逐一建立单变量 Cox 比例风险回归模型，评估高表达组相对于低表达组的风险比（HR）。
+# ==============================================================================
+
+cat("\nRunning Univariate Cox regression models...\n")
+cox_results <- list()
+
+for (gene in genes_list) {
+  # Set the reference group to 'Low' so HR represents High vs Low
+  merged_data[[gene]] <- factor(merged_data[[gene]], levels = c("Low", "High"))
+  
+  formula_str <- paste0("Surv(time, event) ~ ", "`", gene, "`")
+  
+  fit_cox <- tryCatch({
+    coxph(as.formula(formula_str), data = merged_data)
+  }, error = function(e) {
+    NULL
+  })
+  
+  if (is.null(fit_cox)) next
+  
+  sum_cox <- summary(fit_cox)
+  coef_info <- sum_cox$coefficients
+  conf_info <- sum_cox$conf.int
+  
+  hr_val <- coef_info[1, "exp(coef)"]
+  p_val_cox <- coef_info[1, "Pr(>|z|)"]
+  ci_lower <- conf_info[1, "lower .95"]
+  ci_upper <- conf_info[1, "upper .95"]
+  
+  cox_results[[gene]] <- data.frame(
+    gene_symbol = gene,
+    coef = coef_info[1, "coef"],
+    HR = hr_val,
+    HR_CI_lower = ci_lower,
+    HR_CI_upper = ci_upper,
+    p_value = p_val_cox,
+    stringsAsFactors = FALSE
+  )
+}
+
+# Bind list to dataframe and sort by p-value
+cox_df <- do.call(rbind, cox_results) %>%
+  arrange(p_value)
+
+# Apply user's threshold: HR > 1.5 and p_value < 0.05
+cox_filtered_df <- cox_df %>%
+  filter(HR > 1.5 & p_value < 0.05)
+
+cat("Univariate Cox regression completed!\n")
+cat("Total genes analyzed:", nrow(cox_df), "\n")
+cat("Genes with HR > 1.5 & P < 0.05:", nrow(cox_filtered_df), "\n")
+
+cat("\nSignificant Prognostic Hazard Genes (HR > 1.5 & P < 0.05):\n")
+print(cox_filtered_df)
+
+
+# ==============================================================================
+# SECTION 6: Save All Results | 第 6 部分：保存分组与所有生存统计结果
 # ==============================================================================
 
 # Save grouping result
@@ -193,12 +254,17 @@ saveRDS(group_df, file = "data_clean/tcga_laml_gene_groups.rds")
 write.csv(logrank_df, file = "data_clean/survival_logrank_results.csv", row.names = FALSE)
 saveRDS(logrank_df, file = "data_clean/survival_logrank_results.rds")
 
-# Extract and save significant genes
-sig_genes_df <- logrank_df %>% filter(p_value < 0.05)
-write.csv(sig_genes_df, file = "data_clean/survival_logrank_sig_genes.csv", row.names = FALSE)
+# Save Cox regression stats
+write.csv(cox_df, file = "data_clean/survival_cox_results.csv", row.names = FALSE)
+saveRDS(cox_df, file = "data_clean/survival_cox_results.rds")
+
+# Save filtered significant hazard genes (HR > 1.5 & P < 0.05)
+write.csv(cox_filtered_df, file = "data_clean/survival_cox_sig_danger_genes.csv", row.names = FALSE)
 
 cat("\nSaved output files in data_clean/:\n")
 cat("  - tcga_laml_gene_groups.csv / .rds\n")
 cat("  - survival_logrank_results.csv / .rds\n")
-cat("  - survival_logrank_sig_genes.csv\n")
+cat("  - survival_cox_results.csv / .rds\n")
+cat("  - survival_cox_sig_danger_genes.csv\n")
+
 
