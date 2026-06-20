@@ -313,11 +313,12 @@ p_forest <- ggplot(plot_forest_df, aes(x = HR, y = gene_symbol)) +
 ggsave("results/forest_plot_prognostic_genes.png", plot = p_forest, width = 7.5, height = 5.5, dpi = 300)
 cat("Forest Plot saved to results/forest_plot_prognostic_genes.png\n")
 
-# 2. Kaplan-Meier survival curves panel
-cat("Generating KM survival curves for 4 representative genes...\n")
+# 2. Kaplan-Meier survival curves panels (13 genes across 4 images)
+cat("Generating KM survival curves for all 13 prognostic hazard genes (divided into 4 panels)...\n")
 library(survminer)
 
-target_genes <- c("IL1R2", "SLC15A3", "NKX2-3", "IL3RA")
+# Sorted by p-value
+target_genes <- cox_filtered_df$gene_symbol
 plots_list <- list()
 
 for (gene in target_genes) {
@@ -354,17 +355,30 @@ for (gene in target_genes) {
   plots_list[[gene]] <- p_km
 }
 
-# Arrange the 4 ggsurvplots in a 2x2 grid
-res_grid <- arrange_ggsurvplots(
-  plots_list,
-  print = FALSE,
-  ncol = 2,
-  nrow = 2
+# Group plots into 4 panels (4 + 3 + 3 + 3 = 13 plots)
+panel_indices <- list(
+  panel1 = 1:4,
+  panel2 = 5:7,
+  panel3 = 8:10,
+  panel4 = 11:13
 )
 
-# Save the combined grid to PNG
-ggsave("results/km_curves_top_genes.png", plot = res_grid, width = 11, height = 9, dpi = 300)
-cat("KM curves saved to results/km_curves_top_genes.png\n")
+for (p_name in names(panel_indices)) {
+  indices <- panel_indices[[p_name]]
+  p_subset <- plots_list[indices]
+  
+  # Arrange plots in a 2x2 grid
+  res_grid <- arrange_ggsurvplots(
+    p_subset,
+    print = FALSE,
+    ncol = 2,
+    nrow = 2
+  )
+  
+  out_path <- paste0("results/km_curves_", p_name, ".png")
+  ggsave(out_path, plot = res_grid, width = 11, height = 9, dpi = 300)
+  cat("Saved KM curve panel to", out_path, "\n")
+}
 
 
 # ==============================================================================
@@ -374,14 +388,30 @@ cat("KM curves saved to results/km_curves_top_genes.png\n")
 cat("\nCreating Week4 directory and copying final outputs...\n")
 dir.create("Week4", recursive = TRUE, showWarnings = FALSE)
 
+# Clean up any old km_curves_top_genes.png file if it exists
+if (file.exists("Week4/km_curves_top_genes.png")) {
+  file.remove("Week4/km_curves_top_genes.png")
+}
+if (file.exists("results/km_curves_top_genes.png")) {
+  file.remove("results/km_curves_top_genes.png")
+}
+
 # Copy files
 file.copy("data_clean/survival_cox_sig_danger_genes.csv", "Week4/sig_degs_survival_filtered.csv", overwrite = TRUE)
 file.copy("results/forest_plot_prognostic_genes.png", "Week4/forest_plot_prognostic_genes.png", overwrite = TRUE)
-file.copy("results/km_curves_top_genes.png", "Week4/km_curves_top_genes.png", overwrite = TRUE)
+
+for (p_name in names(panel_indices)) {
+  src <- paste0("results/km_curves_", p_name, ".png")
+  dst <- paste0("Week4/km_curves_", p_name, ".png")
+  file.copy(src, dst, overwrite = TRUE)
+}
 
 cat("Successfully copied final outputs to Week4/:\n")
 cat("  - Week4/sig_degs_survival_filtered.csv\n")
 cat("  - Week4/forest_plot_prognostic_genes.png\n")
-cat("  - Week4/km_curves_top_genes.png\n")
+cat("  - Week4/km_curves_panel1.png\n")
+cat("  - Week4/km_curves_panel2.png\n")
+cat("  - Week4/km_curves_panel3.png\n")
+cat("  - Week4/km_curves_panel4.png\n")
 
 cat("\nPipeline script 07 completed successfully!\n")
