@@ -1,0 +1,29 @@
+"gene_symbol","subcellular_localization","novelty_status","modality_category","logFC_discovery","logFC_validation","survival_HR","survival_p_value","priority_score"
+"GZMB","Secreted / Extracellular space","Novel Candidate","Monoclonal antibody / ADC / CAR-T",-3.02082542050045,-0.173482245915444,1.62933063062515,0.0335414845138828,7
+"CD14","Plasma membrane / Secreted","Novel Candidate","Monoclonal antibody / ADC / CAR-T",-3.28503942602324,-0.203269191444119,1.64093145635876,0.0317397910701298,7
+"SLC15A3","Lysosomal membrane / Plasma membrane","Novel Candidate","Monoclonal antibody / ADC / CAR-T",-3.68866257173868,-0.158116306037719,1.84822142984164,0.00862666367984325,7
+"FPR2","Plasma membrane (GPCR)","Novel Candidate","Monoclonal antibody / ADC / CAR-T",-3.8753362435605,-0.182324973877188,1.58819821419864,0.0442205970866865,7
+"CMTM2","Plasma membrane / Transmembrane","Novel Candidate","Monoclonal antibody / ADC / CAR-T",-4.79982101902055,-0.17096835451738,1.63258912560458,0.0334990086099293,7
+"CXCR2","Plasma membrane (GPCR)","Novel Candidate","Monoclonal antibody / ADC / CAR-T",-5.36291112222097,-0.206417380774474,1.65771177851436,0.0288128247829158,7
+"VNN2","Plasma membrane (GPI-anchored)","Novel Candidate","Monoclonal antibody / ADC / CAR-T",-5.77346431313454,-0.212888236918481,1.78215953469,0.0134110769601658,7
+"IL1R2","Plasma membrane / Secreted","Novel Candidate","Monoclonal antibody / ADC / CAR-T",-6.80926010894711,-0.211108877925416,1.86948460959858,0.00616099834794413,7
+"CXCR1","Plasma membrane (GPCR)","Novel Candidate","Monoclonal antibody / ADC / CAR-T",-8.03548504322808,-0.182103594052666,1.72872584515237,0.0167893836303967,7
+"CPXM1","Secreted (Extracellular)","Novel Candidate","Monoclonal antibody / ADC / CAR-T",6.40223759518616,0.175519610831773,NA,NA,5
+"C1QTNF4","Secreted (Extracellular)","Novel Candidate","Monoclonal antibody / ADC / CAR-T",4.62878426399436,0.163255585794276,NA,NA,5
+"COL24A1","Secreted / Extracellular matrix","Novel Candidate","Monoclonal antibody / ADC / CAR-T",3.99842220029937,0.225738847438293,NA,NA,5
+"NPW","Secreted (Extracellular)","Novel Candidate","Monoclonal antibody / ADC / CAR-T",3.72619265893025,0.175345164123053,NA,NA,5
+"MAMDC2","Secreted / Extracellular matrix","Novel Candidate","Monoclonal antibody / ADC / CAR-T",3.59201986566437,0.262108264500436,NA,NA,5
+"NRXN2","Plasma membrane","Novel Candidate","Monoclonal antibody / ADC / CAR-T",3.41564226438309,0.211866724202946,NA,NA,5
+"EGFL7","Secreted / Extracellular matrix","Novel Candidate","Monoclonal antibody / ADC / CAR-T",3.34797662653383,0.161562122644117,NA,NA,5
+"TPSAB1","Secreted (Extracellular)","Novel Candidate","Monoclonal antibody / ADC / CAR-T",3.2152308284791,0.162494317215065,NA,NA,5
+"TPSB2","Secreted (Extracellular)","Novel Candidate","Monoclonal antibody / ADC / CAR-T",2.80399568435263,0.187985364575319,NA,NA,5
+"UMODL1","Plasma membrane / Secreted","Novel Candidate","Monoclonal antibody / ADC / CAR-T",2.22333126842074,0.172813007967879,NA,NA,5
+"NKX2-3","Nucleus","Novel Candidate","Small-molecule inhibitor",1.83789141669924,0.179565619642584,1.8328461811905,0.00877918826091194,5
+"NCF1C","Cytoplasm","Novel Candidate","Small-molecule inhibitor",-3.05008857109669,-0.201305523284587,1.81050446967805,0.0106145311049407,5
+"NCF1","Cytoplasm","Novel Candidate","Small-molecule inhibitor",-3.89380686902822,-0.173409779701827,1.80342028979452,0.0110234750162625,5
+"MEX3B","Cytoplasm / Nucleus","Novel Candidate","Small-molecule inhibitor",3.89236341973891,0.178628221424172,NA,NA,3
+"CLIP2","Cytoplasm","Novel Candidate","Small-molecule inhibitor",3.37154874582148,0.169838405974438,NA,NA,3
+"CCNA1","Nucleus / Cytoplasm","Novel Candidate","Small-molecule inhibitor",3.06141129282735,0.173762694291917,NA,NA,3
+"TRIM71","Cytoplasm","Novel Candidate","Small-molecule inhibitor",2.63302316719579,0.158096107767311,NA,NA,3
+"PDE6G","Cytoplasm / Membrane","Novel Candidate","Small-molecule inhibitor",2.57576329176729,0.166756238242473,NA,NA,3
+"IRX3","Nucleus","Novel Candidate","Small-molecule inhibitor",1.80278677430212,0.184185280409115,NA,NA,2
