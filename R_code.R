@@ -1,3 +1,17 @@
+# ==============================================================================
+# Complete Target Discovery and Validation Pipeline | 完整靶点发现与验证代码流
+# ==============================================================================
+
+# ==============================================================================
+# SECTION 1: DOWNLOAD TCGA-LAML DATASET
+# Description: Downloads and formats the TCGA Acute Myeloid Leukemia dataset from GDC, applying the getBarcodeInfo and GDCquery_clinic namespace patches to bypass schema changes.
+# ==============================================================================
+
+## ----setup, include=FALSE-----------------------------------------------------
+knitr::opts_chunk$set(echo = TRUE)
+
+
+## -----------------------------------------------------------------------------
 # scripts/01_download_tcga_laml.R
 
 # ==============================================================================
@@ -12,7 +26,7 @@ if (!requireNamespace("BiocManager", quietly = TRUE)) {
 }
 
 required_bioc <- c("TCGAbiolinks", "SummarizedExperiment")
-required_cran <- c("data.table", "dplyr", "stringr", "jsonlite", "httr", "plyr")
+required_cran <- c("data.table", "dplyr", "stringr")
 
 for (pkg in required_bioc) {
   if (!requireNamespace(pkg, quietly = TRUE)) {
@@ -355,13 +369,6 @@ data_prep <- GDCprepare(
   directory = "data_raw/tcga_laml"
 )
 
-cat("Available assays:\n")
-print(assayNames(data_prep))
-
-if (!"tpm_unstrand" %in% assayNames(data_prep)) {
-  stop("The assay 'tpm_unstrand' was not found. Please check assayNames(data_prep).")
-}
-
 # Extract TPM matrix (STAR unstranded TPM)
 tcga_tpm <- assay(data_prep, "tpm_unstrand")
 
@@ -385,10 +392,9 @@ saveRDS(
 
 # Save gene annotation information
 gene_info <- as.data.frame(rowRanges(data_prep))
-# Clean gene info format slightly (matching original) and add clean Ensembl ID
+# Clean gene info format slightly (matching original)
 gene_info <- data.frame(
   gene_id = gene_info$gene_id,
-  ensembl_id_clean = str_remove(gene_info$gene_id, "\\..*$"),
   gene_name = gene_info$gene_name,
   gene_type = gene_info$gene_type,
   stringsAsFactors = FALSE
@@ -485,10 +491,8 @@ saveRDS(
 
 tcga_sample_info <- data.frame(
   sample_id = colnames(tcga_tpm),
-  patient_id = substr(colnames(tcga_tpm), 1, 12),
   source = "TCGA",
-  group = "AML",
-  stringsAsFactors = FALSE
+  group = "AML"
 )
 
 write.csv(
@@ -500,8 +504,11 @@ write.csv(
 cat("TCGA-LAML download and preprocessing finished.\n")
 
 
-## -----------------------------------------------------------------------------
-# scripts/02_download_gtex.R
+
+# ==============================================================================
+# SECTION 2: DOWNLOAD GTEX NORMAL CONTROLS
+# Description: Downloads GTEx V8 whole blood expression matrix and sample metadata from Google Cloud storage, filtering for normal blood controls.
+# ==============================================================================
 
 # ==============================================================================
 # SECTION 0: Load Required Packages | 第 0 部分：加载所需的 R 包
@@ -797,8 +804,11 @@ print(head(gtex_sample_info_clean))
 cat("GTEx normal tissue download and preprocessing finished.\n")
 
 
-## -----------------------------------------------------------------------------
-# scripts/03_download_gse13159.R
+
+# ==============================================================================
+# SECTION 3: DOWNLOAD AND PREPROCESS GSE13159 VALIDATION COHORT
+# Description: Downloads the MILE study dataset GSE13159 from GEO, maps probes to gene symbols, and extracts AML and healthy controls.
+# ==============================================================================
 
 # ==============================================================================
 # SECTION 0: Setup and Package Loading | 第 0 部分：准备与加载包
@@ -1123,8 +1133,10 @@ print(dim(gse_expr_final))
 
 
 
-## -----------------------------------------------------------------------------
-# scripts/04_merge_discovery_cohort.R
+# ==============================================================================
+# SECTION 4: MERGE TCGA AND GTEX DISCOVERY COHORT
+# Description: Finds overlapping genes and merges TCGA-LAML (AML) and GTEx (Normal) expression matrices and metadata to create the discovery cohort.
+# ==============================================================================
 
 # ==============================================================================
 # SECTION 0: Load Required Packages | 第 0 部分：加载所需的 R 包
@@ -1249,5 +1261,1905 @@ saveRDS(
 )
 
 cat("Combined discovery cohort saved successfully!\n")
+
+
+
+
+# ==============================================================================
+# SECTION 5: DIFFERENTIAL EXPRESSION ANALYSIS (LIMMA)
+# Description: Performs limma differential expression analysis on both discovery and validation cohorts, intersecting significant results to identify robust biomarkers.
+# ==============================================================================
+
+# scripts/05_diff_expression_analysis.R
+
+# ==============================================================================
+# SECTION 0: Setup and Package Loading | 第 0 部分：准备与加载包
+# ------------------------------------------------------------------------------
+# [EN] Check for and install required BioConductor and CRAN packages, then load libraries.
+# [ZH] 检查并自动安装所需的 BioConductor 和 CRAN 包，然后加载所需的 R 库。
+# ==============================================================================
+
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager")
+}
+
+required_bioc <- c("limma")
+required_cran <- c("data.table", "dplyr", "ggplot2", "pheatmap", "ggrepel")
+
+for (pkg in required_bioc) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    BiocManager::install(pkg)
+  }
+}
+
+for (pkg in required_cran) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg, repos = "https://cloud.r-project.org")
+  }
+}
+
+library(limma)
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(pheatmap)
+library(ggrepel)
+
+# Create output folders
+dir.create("results", recursive = TRUE, showWarnings = FALSE)
+dir.create("data_clean", recursive = TRUE, showWarnings = FALSE)
+
+
+# ==============================================================================
+# SECTION 1: Load Datasets | 第 1 部分：读取输入数据
+# ------------------------------------------------------------------------------
+# [EN] Load Discovery cohort (TCGA+GTEx) and Validation cohort (GSE13159) data.
+# [ZH] 读取发现集（TCGA+GTEx）与独立验证集（GSE13159）的表达矩阵及临床元数据。
+# ==============================================================================
+
+cat("Loading datasets...\n")
+# Discovery Cohort
+discovery_expr <- readRDS("data_clean/discovery_expr_log2tpm.rds")
+discovery_sample_info <- readRDS("data_clean/discovery_sample_info.rds")
+
+# Validation Cohort
+gse_expr <- readRDS("data_clean/gse13159_expr_clean.rds")
+gse_sample_info <- readRDS("data_clean/gse13159_sample_info.rds")
+
+cat("Discovery matrix dimensions:", dim(discovery_expr)[1], "genes x", dim(discovery_expr)[2], "samples\n")
+cat("Validation matrix dimensions:", dim(gse_expr)[1], "genes x", dim(gse_expr)[2], "samples\n")
+
+
+# ==============================================================================
+# SECTION 2: PCA Diagnostic of Discovery Cohort | 第 2 部分：发现集 PCA 降维诊断
+# ------------------------------------------------------------------------------
+# [EN] Run PCA on the raw merged matrix to visualize platform batch and biological separation.
+# [ZH] 对合并后的发现集运行 PCA，观察样本在测序来源与疾病分组上的分布情况。
+# ==============================================================================
+
+cat("Running PCA on Discovery Cohort...\n")
+# Filter out zero variance genes for PCA
+var_genes <- apply(discovery_expr, 1, var)
+expr_pca_input <- discovery_expr[var_genes > 0, ]
+
+pca_res <- prcomp(t(expr_pca_input), scale. = TRUE)
+pca_df <- data.frame(
+  sample_id = rownames(pca_res$x),
+  PC1 = pca_res$x[, 1],
+  PC2 = pca_res$x[, 2],
+  source = discovery_sample_info$source,
+  group = discovery_sample_info$group
+)
+
+percent_var <- round(pca_res$sdev^2 / sum(pca_res$sdev^2) * 100, 2)
+
+# Save PCA plot colored by biological group
+p_pca <- ggplot(pca_df, aes(x = PC1, y = PC2, color = group, shape = source)) +
+  geom_point(size = 3, alpha = 0.7) +
+  theme_bw() +
+  scale_color_manual(values = c("Normal" = "#2E75B6", "AML" = "#C00000")) +
+  labs(
+    title = "PCA of Merged Discovery Cohort",
+    x = paste0("PC1 (", percent_var[1], "%)"),
+    y = paste0("PC2 (", percent_var[2], "%)")
+  ) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+ggsave("results/discovery_pca.png", plot = p_pca, width = 7, height = 5.5, dpi = 300)
+cat("Discovery PCA plot saved to results/discovery_pca.png\n")
+
+
+# ==============================================================================
+# SECTION 3: Differential Expression in Discovery Cohort (limma) | 第 3 部分：发现集差异表达分析
+# ------------------------------------------------------------------------------
+# [EN] Run limma directly on the uncorrected cohort. (Note: ComBat is bypassed
+#      because batch (TCGA vs GTEx) is 100% confounded with biology (AML vs Normal).
+#      Instead, robust biological markers are identified via cross-platform intersection).
+# [ZH] 直接在未校正的合并发现集上运行 limma 差异分析。（注：由于测序批次与疾病分组
+#      100% 完全混杂，使用 ComBat 强行去批次会抹杀所有生物学差异。我们将通过后续跨平台验证集
+#      求交集来过滤掉技术批次假阳性）。
+# ==============================================================================
+
+cat("Running limma on Discovery Cohort...\n")
+discovery_sample_info$group <- factor(discovery_sample_info$group, levels = c("Normal", "AML"))
+
+# Construct design matrix (Normal is baseline)
+mod_d <- model.matrix(~ group, data = discovery_sample_info)
+
+# Fit linear model and run Empirical Bayes shrinkage
+fit_d <- lmFit(discovery_expr, mod_d)
+fit2_d <- eBayes(fit_d)
+
+# Extract complete results
+degs_d_all <- topTable(fit2_d, coef = 2, number = Inf, adjust.method = "BH")
+degs_d_all$ensembl_id <- rownames(degs_d_all)
+
+# Read gene mapping file to add Gene Symbols
+gene_map <- read.csv("data_raw/gtex/gtex_gene_info.csv", stringsAsFactors = FALSE)
+gene_map_clean <- gene_map %>%
+  select(ensembl_id_clean, gene_symbol) %>%
+  distinct()
+
+degs_d_all <- degs_d_all %>%
+  inner_join(gene_map_clean, by = c("ensembl_id" = "ensembl_id_clean")) %>%
+  select(ensembl_id, gene_symbol, logFC, AveExpr, t, P.Value, adj.P.Val, B)
+
+# Save complete table
+write.csv(degs_d_all, file = "data_clean/discovery_degs_all.csv", row.names = FALSE)
+
+
+# ==============================================================================
+# SECTION 4: Differential Expression in Validation Cohort (limma) | 第 4 部分：独立验证集差异表达分析
+# ------------------------------------------------------------------------------
+# [EN] Filter GSE13159 for AML and Normal samples, and identify validation DEGs.
+# [ZH] 筛选 GSE13159 中的 AML 与 Normal 正常对照样本，并使用 limma 计算验证集差异表达基因。
+# ==============================================================================
+
+cat("Running limma on GSE13159 Validation Cohort...\n")
+
+# Filter for AML vs Normal samples in GSE13159
+valid_samples <- gse_sample_info %>%
+  filter(group %in% c("AML", "Normal")) %>%
+  pull(sample_id)
+
+gse_expr_subset <- gse_expr[, valid_samples]
+gse_sample_subset <- gse_sample_info %>%
+  filter(sample_id %in% valid_samples)
+
+gse_sample_subset$group <- factor(gse_sample_subset$group, levels = c("Normal", "AML"))
+
+cat("Validation subset size:", nrow(gse_expr_subset), "genes x", ncol(gse_expr_subset), "samples\n")
+
+# Fit linear model
+mod_v <- model.matrix(~ group, data = gse_sample_subset)
+fit_v <- lmFit(gse_expr_subset, mod_v)
+fit2_v <- eBayes(fit_v)
+
+# Extract complete results
+degs_v_all <- topTable(fit2_v, coef = 2, number = Inf, adjust.method = "BH")
+degs_v_all$gene_symbol <- rownames(degs_v_all)
+degs_v_all <- degs_v_all %>%
+  select(gene_symbol, logFC, AveExpr, t, P.Value, adj.P.Val, B)
+
+# Save complete table
+write.csv(degs_v_all, file = "data_clean/gse13159_degs_all.csv", row.names = FALSE)
+
+
+# ==============================================================================
+# SECTION 5: Filtering, Overlap, and Plotting Wrapper Function | 第 5 部分：过滤、求交集与绘图函数
+# ------------------------------------------------------------------------------
+# [EN] Define a helper function to run the filtering and plotting for a given significance threshold.
+# [ZH] 定义一个辅助函数，针对给定的显著性阈值执行过滤、交集计算及图表生成。
+# ==============================================================================
+
+run_filtering_and_plots <- function(adjp_thresh, logfc_d_thresh, logfc_v_thresh, suffix = "") {
+  cat("\n======================================================================\n")
+  cat("Running biological target filtering with adj.P.Val <", adjp_thresh, "...\n")
+  
+  # Define filenames
+  fn_sig_d <- paste0("data_clean/discovery_degs_sig", suffix, ".csv")
+  fn_overlap_csv <- paste0("data_clean/sig_degs_overlap", suffix, ".csv")
+  fn_overlap_rds <- paste0("data_clean/sig_degs_overlap", suffix, ".rds")
+  
+  fn_vol_d <- paste0("results/discovery_volcano", suffix, ".png")
+  fn_vol_v <- paste0("results/validation_volcano", suffix, ".png")
+  fn_heatmap <- paste0("results/heatmap_robust_degs", suffix, ".png")
+  
+  # 1. Filter Discovery significant DEGs
+  degs_d_sig <- degs_d_all %>%
+    filter(adj.P.Val < adjp_thresh & abs(logFC) > logfc_d_thresh)
+  cat("Discovery significant DEGs (|log2FC| >", logfc_d_thresh, "):", nrow(degs_d_sig), "\n")
+  write.csv(degs_d_sig, file = fn_sig_d, row.names = FALSE)
+  
+  # 2. Filter Validation significant DEGs
+  degs_v_sig <- degs_v_all %>%
+    filter(adj.P.Val < adjp_thresh & abs(logFC) > logfc_v_thresh)
+  cat("Validation significant DEGs (|logFC| >", logfc_v_thresh, "):", nrow(degs_v_sig), "\n")
+  
+  # 3. Intersect shared genes with consistent directions
+  discovery_up <- degs_d_sig %>% filter(logFC > 0) %>% pull(gene_symbol)
+  discovery_down <- degs_d_sig %>% filter(logFC < 0) %>% pull(gene_symbol)
+  
+  validation_up <- degs_v_sig %>% filter(logFC > 0) %>% pull(gene_symbol)
+  validation_down <- degs_v_sig %>% filter(logFC < 0) %>% pull(gene_symbol)
+  
+  overlap_up <- intersect(discovery_up, validation_up)
+  overlap_down <- intersect(discovery_down, validation_down)
+  overlap_all <- c(overlap_up, overlap_down)
+  
+  cat("Robust Up-regulated genes (overlap):", length(overlap_up), "\n")
+  cat("Robust Down-regulated genes (overlap):", length(overlap_down), "\n")
+  cat("Total robust overlapping biomarkers:", length(overlap_all), "\n")
+  
+  if (length(overlap_all) == 0) {
+    cat("Warning: No overlapping biomarkers found! Skipping plots.\n")
+    return(NULL)
+  }
+  
+  # Combine overlap details
+  degs_d_overlap <- degs_d_sig %>%
+    filter(gene_symbol %in% overlap_all) %>%
+    rename(logFC_discovery = logFC, adj.P.Val_discovery = adj.P.Val) %>%
+    select(ensembl_id, gene_symbol, logFC_discovery, adj.P.Val_discovery)
+  
+  degs_v_overlap <- degs_v_sig %>%
+    filter(gene_symbol %in% overlap_all) %>%
+    rename(logFC_validation = logFC, adj.P.Val_validation = adj.P.Val) %>%
+    select(gene_symbol, logFC_validation, adj.P.Val_validation)
+  
+  robust_biomarkers <- degs_d_overlap %>%
+    inner_join(degs_v_overlap, by = "gene_symbol") %>%
+    mutate(
+      direction = ifelse(gene_symbol %in% overlap_up, "Up", "Down")
+    ) %>%
+    arrange(desc(abs(logFC_discovery)))
+  
+  # Save robust overlapping biomarkers
+  write.csv(robust_biomarkers, file = fn_overlap_csv, row.names = FALSE)
+  saveRDS(robust_biomarkers, file = fn_overlap_rds)
+  
+  # 4. Generate Volcano Plots
+  # Discovery Volcano
+  temp_d <- degs_d_all %>%
+    mutate(
+      change = case_when(
+        gene_symbol %in% overlap_up ~ "Robust Up",
+        gene_symbol %in% overlap_down ~ "Robust Down",
+        adj.P.Val < adjp_thresh & logFC > logfc_d_thresh ~ "Discovery Up Only",
+        adj.P.Val < adjp_thresh & logFC < -logfc_d_thresh ~ "Discovery Down Only",
+        TRUE ~ "Not Significant"
+      )
+    )
+  
+  top_up_labels <- robust_biomarkers %>% filter(direction == "Up") %>% head(10) %>% pull(gene_symbol)
+  top_down_labels <- robust_biomarkers %>% filter(direction == "Down") %>% head(10) %>% pull(gene_symbol)
+  label_genes_d <- temp_d %>% filter(gene_symbol %in% c(top_up_labels, top_down_labels))
+  
+  p_vol_d <- ggplot(temp_d, aes(x = logFC, y = -log10(adj.P.Val), color = change)) +
+    geom_point(alpha = 0.5, size = 1.5) +
+    scale_color_manual(values = c(
+      "Robust Up" = "#C00000",
+      "Robust Down" = "#2E75B6",
+      "Discovery Up Only" = "#FFC000",
+      "Discovery Down Only" = "#9BC2E6",
+      "Not Significant" = "grey"
+    )) +
+    geom_vline(xintercept = c(-logfc_d_thresh, logfc_d_thresh), linetype = "dashed", color = "darkgrey") +
+    geom_hline(yintercept = -log10(adjp_thresh), linetype = "dashed", color = "darkgrey") +
+    geom_text_repel(
+      data = label_genes_d,
+      aes(label = gene_symbol),
+      size = 3,
+      color = "black",
+      max.overlaps = 20
+    ) +
+    theme_bw() +
+    labs(
+      title = paste0("Discovery Cohort Volcano (adj.P < ", adjp_thresh, ")"),
+      x = "log2(Fold Change)",
+      y = "-log10(Adjusted P-Value)"
+    ) +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+  
+  ggsave(fn_vol_d, plot = p_vol_d, width = 8, height = 6.5, dpi = 300)
+  
+  # Validation Volcano
+  temp_v <- degs_v_all %>%
+    mutate(
+      change = case_when(
+        gene_symbol %in% overlap_up ~ "Robust Up",
+        gene_symbol %in% overlap_down ~ "Robust Down",
+        adj.P.Val < adjp_thresh & logFC > logfc_v_thresh ~ "Validation Up Only",
+        adj.P.Val < adjp_thresh & logFC < -logfc_v_thresh ~ "Validation Down Only",
+        TRUE ~ "Not Significant"
+      )
+    )
+  
+  label_genes_v <- temp_v %>% filter(gene_symbol %in% c(top_up_labels, top_down_labels))
+  
+  p_vol_v <- ggplot(temp_v, aes(x = logFC, y = -log10(adj.P.Val), color = change)) +
+    geom_point(alpha = 0.5, size = 1.5) +
+    scale_color_manual(values = c(
+      "Robust Up" = "#C00000",
+      "Robust Down" = "#2E75B6",
+      "Validation Up Only" = "#FFC000",
+      "Validation Down Only" = "#9BC2E6",
+      "Not Significant" = "grey"
+    )) +
+    geom_vline(xintercept = c(-logfc_v_thresh, logfc_v_thresh), linetype = "dashed", color = "darkgrey") +
+    geom_hline(yintercept = -log10(adjp_thresh), linetype = "dashed", color = "darkgrey") +
+    geom_text_repel(
+      data = label_genes_v,
+      aes(label = gene_symbol),
+      size = 3,
+      color = "black",
+      max.overlaps = 20
+    ) +
+    theme_bw() +
+    labs(
+      title = paste0("Validation Cohort Volcano (adj.P < ", adjp_thresh, ")"),
+      x = "logFC",
+      y = "-log10(Adjusted P-Value)"
+    ) +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+  
+  ggsave(fn_vol_v, plot = p_vol_v, width = 8, height = 6.5, dpi = 300)
+  
+  # 5. Generate Heatmap of top 50 overlapping genes
+  top50_overlap <- robust_biomarkers %>% head(50)
+  top50_expr_d <- discovery_expr[top50_overlap$ensembl_id, ]
+  rownames(top50_expr_d) <- top50_overlap$gene_symbol
+  
+  sample_annot <- data.frame(
+    Group = discovery_sample_info$group,
+    Source = discovery_sample_info$source,
+    row.names = discovery_sample_info$sample_id
+  )
+  
+  annot_colors <- list(
+    Group = c("Normal" = "#2E75B6", "AML" = "#C00000"),
+    Source = c("TCGA" = "#ED7D31", "GTEx" = "#70AD47")
+  )
+  
+  pheatmap(
+    top50_expr_d,
+    scale = "row",
+    annotation_col = sample_annot,
+    annotation_colors = annot_colors,
+    show_colnames = FALSE,
+    show_rownames = TRUE,
+    fontsize_row = 7,
+    cluster_cols = TRUE,
+    cluster_rows = TRUE,
+    filename = fn_heatmap,
+    width = 10,
+    height = 8
+  )
+  cat("Outputs for threshold", adjp_thresh, "saved successfully.\n")
+}
+
+
+# ==============================================================================
+# SECTION 6: Execute Runs for Both Thresholds | 第 6 部分：执行双阈值分析运行
+# ------------------------------------------------------------------------------
+# [EN] Run the pipeline for both adj.P.Val < 0.05 and adj.P.Val < 0.01.
+# [ZH] 分别针对 adj.P.Val < 0.05（常规）与 adj.P.Val < 0.01（缩紧/高显著）运行分析。
+# ==============================================================================
+
+# Run 1: Conventional threshold (adj.P.Val < 0.05, Discovery |log2FC| > 1.5, Validation |logFC| > 0.15)
+run_filtering_and_plots(adjp_thresh = 0.05, logfc_d_thresh = 1.5, logfc_v_thresh = 0.15, suffix = "")
+
+# Run 2: Stringent threshold (adj.P.Val < 0.01, Discovery |log2FC| > 1.5, Validation |logFC| > 0.15)
+run_filtering_and_plots(adjp_thresh = 0.01, logfc_d_thresh = 1.5, logfc_v_thresh = 0.15, suffix = "_p01")
+
+cat("Differential expression analysis completed successfully for all thresholds!\n")
+
+
+# ==============================================================================
+# SECTION 6: HEALTHY STEM CELL (HSPC) SAFETY FILTRATION
+# Description: Downloads GSE24759 and filters out targets expressed in normal hematopoetic stem/progenitor cells (HSPCs) using a threshold of 7.0 to minimize off-tumor toxicity.
+# ==============================================================================
+
+# scripts/06_filter_hspc_degs.R
+
+# ==============================================================================
+# SECTION 0: Setup and Package Loading | 第 0 部分：准备与加载包
+# ------------------------------------------------------------------------------
+# [EN] Check for and install required BioConductor and CRAN packages, then load libraries.
+# [ZH] 检查并自动安装所需的 BioConductor 和 CRAN 包，然后加载所需的 R 库。
+# ==============================================================================
+
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager")
+}
+
+required_bioc <- c("GEOquery", "Biobase")
+required_cran <- c("data.table", "dplyr", "stringr", "ggplot2")
+
+for (pkg in required_bioc) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    BiocManager::install(pkg)
+  }
+}
+
+for (pkg in required_cran) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg, repos = "https://cloud.r-project.org")
+  }
+}
+
+library(GEOquery)
+library(Biobase)
+library(data.table)
+library(dplyr)
+library(stringr)
+library(ggplot2)
+
+# Create output folders
+dir.create("results", recursive = TRUE, showWarnings = FALSE)
+dir.create("data_clean", recursive = TRUE, showWarnings = FALSE)
+dir.create("data_raw/gse24759", recursive = TRUE, showWarnings = FALSE)
+
+
+# ==============================================================================
+# SECTION 1: Load Robust Biomarkers (DEGs) | 第 1 部分：读取强健的重叠差异表达基因
+# ------------------------------------------------------------------------------
+# [EN] Load the 131 robust biomarkers identified in Week 3.
+# [ZH] 读取在第三周分析中筛选出的 131 个强健重叠生物标志物（差异表达基因）。
+# ==============================================================================
+
+cat("Loading 131 robust overlapping biomarkers...\n")
+degs_file <- "data_clean/sig_degs_overlap.rds"
+if (!file.exists(degs_file)) {
+  stop("Input file 'data_clean/sig_degs_overlap.rds' not found. Please run scripts/05_diff_expression_analysis.R first.")
+}
+degs_overlap <- readRDS(degs_file)
+cat("Loaded", nrow(degs_overlap), "robust biomarkers.\n")
+
+
+# ==============================================================================
+# SECTION 2: Load or Download GSE24759 Dataset | 第 2 部分：读取或下载 GSE24759 数据集
+# ------------------------------------------------------------------------------
+# [EN] Load GSE24759 from the local directory or download it from GEO if missing.
+# [ZH] 读取本地的 GSE24759 数据集，如果不存在则自动从 GEO 下载。
+# ==============================================================================
+
+options(timeout = 100000)
+gse_matrix_file <- "data_raw/gse24759/GSE24759_series_matrix.txt.gz"
+
+if (!file.exists(gse_matrix_file)) {
+  cat("GSE24759 local file not found. Downloading from GEO...\n")
+  gse_list <- getGEO(
+    GEO = "GSE24759",
+    GSEMatrix = TRUE,
+    getGPL = FALSE,
+    destdir = "data_raw/gse24759"
+  )
+  gse <- gse_list[[1]]
+} else {
+  cat("Loading GSE24759 local Series Matrix file...\n")
+  gse <- getGEO(filename = gse_matrix_file, getGPL = FALSE)
+}
+
+expr_matrix <- exprs(gse)
+pheno <- pData(gse)
+
+cat("GSE24759 expression matrix dimensions:", dim(expr_matrix)[1], "probes x", dim(expr_matrix)[2], "samples\n")
+
+
+# ==============================================================================
+# SECTION 3: Identify Normal HSPC Samples | 第 3 部分：识别正常造血干/祖细胞样本
+# ------------------------------------------------------------------------------
+# [EN] Select primitive cell samples (HSC, CMP, GMP, MEP) from normal controls in GSE24759.
+# [ZH] 从 GSE24759 中筛选出代表原始造血干细胞/祖细胞（HSC, CMP, GMP, MEP）的样本。
+# ==============================================================================
+
+hspc_patterns <- "Hematopoietic stem cell|Common myeloid progenitor|Granulocyte/monocyte progenitor|Megakaryocyte/ erythroid progenitor"
+hspc_idx <- which(grepl(hspc_patterns, pheno$title, ignore.case = TRUE))
+
+if (length(hspc_idx) == 0) {
+  stop("Error: No normal HSPC samples identified in GSE24759. Please check phenotype titles.")
+}
+
+hspc_samples <- pheno$geo_accession[hspc_idx]
+hspc_titles <- pheno$title[hspc_idx]
+
+cat("Identified", length(hspc_samples), "normal HSPC samples in GSE24759.\n")
+
+
+# ==============================================================================
+# SECTION 4: Map Probes to Gene Symbols | 第 4 部分：建立探针与基因名映射表并聚合
+# ------------------------------------------------------------------------------
+# [EN] Map GSE24759 probe IDs to Gene Symbols using local GPL570 annotation,
+#      then aggregate expression matrix to gene-level values using mean.
+# [ZH] 使用本地 GPL570 芯片注释文件将 GSE24759 的探针映射到基因名，然后求均值聚合成基因级别的表达矩阵。
+# ==============================================================================
+
+gpl_file <- "data_raw/gse13159/GPL570.annot.gz"
+if (!file.exists(gpl_file)) {
+  cat("Local GPL570 annotation not found at data_raw/gse13159/GPL570.annot.gz. Downloading...\n")
+  dir.create("data_raw/gse13159", recursive = TRUE, showWarnings = FALSE)
+  download.file(
+    url = "https://ftp.ncbi.nlm.nih.gov/geo/platforms/GPLnnn/GPL570/annot/GPL570.annot.gz",
+    destfile = gpl_file,
+    mode = "wb"
+  )
+}
+
+cat("Parsing GPL570 annotation file...\n")
+gpl_data <- parseGEO(gpl_file)
+gpl_table <- Table(gpl_data)
+
+probe_gene_mapping <- data.frame(
+  probe_id = as.character(gpl_table$ID),
+  gene_symbol_raw = as.character(gpl_table$`Gene symbol`),
+  stringsAsFactors = FALSE
+) %>%
+  mutate(
+    gene_symbol = str_split(gene_symbol_raw, "///", simplify = TRUE)[, 1],
+    gene_symbol = str_trim(gene_symbol)
+  ) %>%
+  filter(!is.na(gene_symbol), gene_symbol != "", gene_symbol != "---", gene_symbol != "NA")
+
+cat("Mapping probes to Gene Symbols in GSE24759...\n")
+expr_dt <- as.data.table(expr_matrix, keep.rownames = "probe_id")
+probe_gene_dt <- as.data.table(probe_gene_mapping)
+
+# Merge
+expr_gene <- merge(expr_dt, probe_gene_dt[, .(probe_id, gene_symbol)], by = "probe_id")
+
+# Aggregate duplicated genes by mean
+cat("Aggregating multi-probe expressions by mean...\n")
+expr_gene_mean <- expr_gene[, lapply(.SD, mean), by = gene_symbol, .SDcols = colnames(expr_matrix)]
+cat("Aggregated matrix dimensions:", nrow(expr_gene_mean), "genes x", ncol(expr_gene_mean) - 1, "samples\n")
+
+# Convert to data.frame
+expr_gene_df <- as.data.frame(expr_gene_mean)
+rownames(expr_gene_df) <- expr_gene_df$gene_symbol
+expr_gene_df$gene_symbol <- NULL
+
+
+# ==============================================================================
+# SECTION 5: Filter Robust Biomarkers against HSPC baseline | 第 5 部分：根据干细胞基准过滤标志物
+# ------------------------------------------------------------------------------
+# [EN] Calculate mean HSPC expression for biomarkers, apply threshold filter (7.0),
+#      and handle unmeasured genes.
+# [ZH] 计算标志物在正常干细胞中的均值表达量，应用阈值（7.0）过滤，并妥善处理未检测基因。
+# ==============================================================================
+
+# Extract mean expression in normal HSPC samples
+overlap_genes_in_gse <- intersect(degs_overlap$gene_symbol, rownames(expr_gene_df))
+cat("Found", length(overlap_genes_in_gse), "out of", nrow(degs_overlap), "robust biomarkers in GSE24759.\n")
+
+hspc_expr <- expr_gene_df[overlap_genes_in_gse, hspc_samples, drop = FALSE]
+gene_hspc_mean <- rowMeans(hspc_expr, na.rm = TRUE)
+
+# Set the expression threshold
+threshold <- 7.0
+cat("Applying normal HSPC expression threshold:", threshold, "(log2 scale)\n")
+
+# Map values back to the full 131 DEGs list
+degs_hspc_evaluated <- degs_overlap %>%
+  mutate(
+    hspc_mean_expr = ifelse(gene_symbol %in% overlap_genes_in_gse, gene_hspc_mean[gene_symbol], NA),
+    hspc_status = case_when(
+      is.na(hspc_mean_expr) ~ "Not-evaluated",
+      hspc_mean_expr >= threshold ~ "HSPC-high",
+      hspc_mean_expr < threshold ~ "HSPC-low"
+    )
+  )
+
+# Separate up and down genes for detailed prints
+up_degs <- degs_hspc_evaluated %>% filter(direction == "Up")
+down_degs <- degs_hspc_evaluated %>% filter(direction == "Down")
+
+cat("\n--- Up-regulated Candidate Biomarkers Evaluation ---\n")
+print(up_degs %>% select(gene_symbol, logFC_discovery, hspc_mean_expr, hspc_status) %>% arrange(desc(hspc_mean_expr)))
+
+cat("\nEvaluation Summary for Up-regulated Genes:\n")
+print(table(up_degs$hspc_status))
+
+cat("\nEvaluation Summary for Down-regulated Genes:\n")
+print(table(down_degs$hspc_status))
+
+# Filter biomarkers list
+# Keep: "HSPC-low" (safe targets) AND "Not-evaluated" (unmeasured, retained by default)
+# Exclude: "HSPC-high" (highly expressed in normal stem cells, high toxicity risk)
+degs_filtered <- degs_hspc_evaluated %>%
+  filter(hspc_status != "HSPC-high")
+
+cat("\nFiltering summary:\n")
+cat("Original robust biomarkers:", nrow(degs_overlap), "\n")
+cat("Filtered out (HSPC-high):", sum(degs_hspc_evaluated$hspc_status == "HSPC-high"), "\n")
+cat("Retained biomarkers:", nrow(degs_filtered), "\n")
+cat("  - Safe (HSPC-low):", sum(degs_filtered$hspc_status == "HSPC-low"), "\n")
+cat("  - Unmeasured (Not-evaluated):", sum(degs_filtered$hspc_status == "Not-evaluated"), "\n")
+
+
+# ==============================================================================
+# SECTION 6: Save Filtered Outputs | 第 6 部分：保存过滤后的输出结果
+# ------------------------------------------------------------------------------
+# [EN] Save full and filtered datasets to CSV and RDS formats.
+# [ZH] 将完整和过滤后的数据集保存为 CSV 和 RDS 格式。
+# ==============================================================================
+
+# Save complete evaluated list (131 genes)
+write.csv(degs_hspc_evaluated, file = "data_clean/sig_degs_overlap_hspc_expr.csv", row.names = FALSE)
+saveRDS(degs_hspc_evaluated, file = "data_clean/sig_degs_overlap_hspc_expr.rds")
+
+# Save final filtered list
+write.csv(degs_filtered, file = "data_clean/sig_degs_hspc_filtered.csv", row.names = FALSE)
+saveRDS(degs_filtered, file = "data_clean/sig_degs_hspc_filtered.rds")
+
+cat("\nSaved output files in data_clean/:\n")
+cat("  - sig_degs_overlap_hspc_expr.csv / .rds\n")
+cat("  - sig_degs_hspc_filtered.csv / .rds\n")
+
+
+# ==============================================================================
+# SECTION 7: Generate Diagnostic Visualization | 第 7 部分：生成诊断可视化图表
+# ==============================================================================
+
+cat("\nGenerating diagnostic visualization for Up-regulated genes...\n")
+
+# Prepare data for plotting
+plot_df <- up_degs %>%
+  mutate(
+    # Set a dummy height for Not-evaluated genes so they appear on x-axis
+    plot_expr = ifelse(hspc_status == "Not-evaluated", 0, hspc_mean_expr),
+    # Sort gene symbols by expression level (unmeasured at the end)
+    gene_symbol = factor(gene_symbol, levels = gene_symbol[order(is.na(hspc_mean_expr), hspc_mean_expr, decreasing = FALSE)])
+  )
+
+p_hspc <- ggplot(plot_df, aes(x = gene_symbol, y = plot_expr, fill = hspc_status)) +
+  geom_col(color = "black", width = 0.7) +
+  geom_hline(yintercept = threshold, linetype = "dashed", color = "#C00000", linewidth = 1) +
+  # Add "N/A" text label on top of the x-axis for not-evaluated genes
+  geom_text(
+    data = filter(plot_df, hspc_status == "Not-evaluated"),
+    aes(y = 0.3, label = "N/A"),
+    color = "grey30",
+    fontface = "bold",
+    size = 3.5
+  ) +
+  coord_flip() +
+  scale_fill_manual(
+    name = "HSPC Status",
+    values = c(
+      "HSPC-low" = "#2E75B6",        # Safe (Blue)
+      "HSPC-high" = "#C00000",       # Toxic / High expression (Red)
+      "Not-evaluated" = "#D9D9D9"    # Unmeasured / Retained (Grey)
+    )
+  ) +
+  labs(
+    title = "Expression of Up-regulated AML Biomarkers in Normal HSPCs",
+    subtitle = "Excluding high-risk targets (Normal HSPC Expression >= 7.0)",
+    x = "Candidate Gene Symbol",
+    y = "Mean Expression in Normal HSPCs (GSE24759, log2 scale)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 13),
+    plot.subtitle = element_text(hjust = 0.5, size = 11, face = "italic", color = "grey30"),
+    panel.grid.major.y = element_blank(),
+    legend.position = "bottom",
+    legend.title = element_text(face = "bold")
+  )
+
+ggsave("results/hspc_expression_up_degs.png", plot = p_hspc, width = 7.5, height = 6, dpi = 300)
+cat("Diagnostic plot saved to results/hspc_expression_up_degs.png\n")
+
+
+# ==============================================================================
+# SECTION 8: Generate Safety-Filtered Volcano Plots and Heatmap | 第 8 部分：生成安全过滤后的火山图与热图
+# ==============================================================================
+
+cat("\nGenerating safety-filtered Volcano Plots and Heatmap...\n")
+library(ggrepel)
+library(pheatmap)
+
+final_up <- degs_filtered %>% filter(direction == "Up") %>% pull(gene_symbol)
+final_down <- degs_filtered %>% filter(direction == "Down") %>% pull(gene_symbol)
+
+# Load full differential expression lists
+degs_d_all <- fread("data_clean/discovery_degs_all.csv")
+degs_v_all <- fread("data_clean/gse13159_degs_all.csv")
+
+# 1. Discovery Volcano Plot (Filtered)
+cat("Saving results/discovery_volcano_hspc_filtered.png...\n")
+temp_d <- degs_d_all %>%
+  mutate(
+    change = case_when(
+      adj.P.Val < 0.01 & logFC > 1.5 & gene_symbol %in% final_up ~ "Final Robust Up",
+      adj.P.Val < 0.01 & logFC < -1.5 & gene_symbol %in% final_down ~ "Final Robust Down",
+      adj.P.Val < 0.01 & logFC > 1.5 ~ "Discovery Up Only",
+      adj.P.Val < 0.01 & logFC < -1.5 ~ "Discovery Down Only",
+      TRUE ~ "Not Significant"
+    )
+  )
+
+top_up_labels <- degs_filtered %>% filter(direction == "Up") %>% arrange(desc(logFC_discovery)) %>% head(10) %>% pull(gene_symbol)
+top_down_labels <- degs_filtered %>% filter(direction == "Down") %>% arrange(logFC_discovery) %>% head(10) %>% pull(gene_symbol)
+label_genes_d <- temp_d %>% filter(gene_symbol %in% c(top_up_labels, top_down_labels))
+
+p_vol_d <- ggplot(temp_d, aes(x = logFC, y = -log10(adj.P.Val), color = change)) +
+  geom_point(alpha = 0.5, size = 1.5) +
+  scale_color_manual(values = c(
+    "Final Robust Up" = "#C00000",
+    "Final Robust Down" = "#2E75B6",
+    "Discovery Up Only" = "#FFC000",
+    "Discovery Down Only" = "#9BC2E6",
+    "Not Significant" = "grey"
+  )) +
+  geom_vline(xintercept = c(-1.5, 1.5), linetype = "dashed", color = "darkgrey") +
+  geom_hline(yintercept = -log10(0.01), linetype = "dashed", color = "darkgrey") +
+  geom_text_repel(
+    data = label_genes_d,
+    aes(label = gene_symbol),
+    size = 3,
+    color = "black",
+    max.overlaps = 20
+  ) +
+  theme_bw() +
+  labs(
+    title = "Discovery Cohort Volcano (Safety Filtered, adj.P < 0.01)",
+    x = "log2FC",
+    y = "-log10(Adjusted P-Value)"
+  ) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+ggsave("results/discovery_volcano_hspc_filtered.png", plot = p_vol_d, width = 8, height = 6.5, dpi = 300)
+
+# 2. Validation Volcano Plot (Filtered)
+cat("Saving results/validation_volcano_hspc_filtered.png...\n")
+temp_v <- degs_v_all %>%
+  mutate(
+    change = case_when(
+      adj.P.Val < 0.01 & logFC > 0.15 & gene_symbol %in% final_up ~ "Final Robust Up",
+      adj.P.Val < 0.01 & logFC < -0.15 & gene_symbol %in% final_down ~ "Final Robust Down",
+      adj.P.Val < 0.01 & logFC > 0.15 ~ "Validation Up Only",
+      adj.P.Val < 0.01 & logFC < -0.15 ~ "Validation Down Only",
+      TRUE ~ "Not Significant"
+    )
+  )
+
+label_genes_v <- temp_v %>% filter(gene_symbol %in% c(top_up_labels, top_down_labels))
+
+p_vol_v <- ggplot(temp_v, aes(x = logFC, y = -log10(adj.P.Val), color = change)) +
+  geom_point(alpha = 0.5, size = 1.5) +
+  scale_color_manual(values = c(
+    "Final Robust Up" = "#C00000",
+    "Final Robust Down" = "#2E75B6",
+    "Validation Up Only" = "#FFC000",
+    "Validation Down Only" = "#9BC2E6",
+    "Not Significant" = "grey"
+  )) +
+  geom_vline(xintercept = c(-0.15, 0.15), linetype = "dashed", color = "darkgrey") +
+  geom_hline(yintercept = -log10(0.01), linetype = "dashed", color = "darkgrey") +
+  geom_text_repel(
+    data = label_genes_v,
+    aes(label = gene_symbol),
+    size = 3,
+    color = "black",
+    max.overlaps = 20
+  ) +
+  theme_bw() +
+  labs(
+    title = "Validation Cohort Volcano (Safety Filtered, adj.P < 0.01)",
+    x = "logFC",
+    y = "-log10(Adjusted P-Value)"
+  ) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+ggsave("results/validation_volcano_hspc_filtered.png", plot = p_vol_v, width = 8, height = 6.5, dpi = 300)
+
+# 3. Discovery Heatmap (Filtered)
+cat("Saving results/heatmap_hspc_filtered.png...\n")
+discovery_expr <- readRDS("data_clean/discovery_expr_log2tpm.rds")
+discovery_sample_info <- readRDS("data_clean/discovery_sample_info.rds")
+
+top50_filtered <- degs_filtered %>%
+  arrange(desc(abs(logFC_discovery))) %>%
+  head(50)
+
+top50_expr_d <- discovery_expr[top50_filtered$ensembl_id, ]
+rownames(top50_expr_d) <- top50_filtered$gene_symbol
+
+sample_annot <- data.frame(
+  Group = discovery_sample_info$group,
+  Source = discovery_sample_info$source,
+  row.names = discovery_sample_info$sample_id
+)
+
+annot_colors <- list(
+  Group = c("Normal" = "#2E75B6", "AML" = "#C00000"),
+  Source = c("TCGA" = "#ED7D31", "GTEx" = "#70AD47")
+)
+
+pheatmap(
+  top50_expr_d,
+  scale = "row",
+  annotation_col = sample_annot,
+  annotation_colors = annot_colors,
+  show_colnames = FALSE,
+  show_rownames = TRUE,
+  fontsize_row = 7,
+  cluster_cols = TRUE,
+  cluster_rows = TRUE,
+  filename = "results/heatmap_hspc_filtered.png",
+  width = 10,
+  height = 8
+)
+
+cat("\nPipeline script 06 completed successfully with final safety-filtered plots!\n")
+
+
+# ==============================================================================
+# SECTION 7: CLINICAL SURVIVAL ASSOCIATION (COX & KAPLAN-MEIER)
+# Description: Runs univariate Cox regression and log-rank Kaplan-Meier curves on the TCGA LAML cohort to identify genes significantly associated with poor patient prognosis.
+# ==============================================================================
+
+# scripts/07_survival_analysis.R
+
+# ==============================================================================
+# SECTION 0: Setup and Package Loading | 第 0 部分：准备与加载包
+# ------------------------------------------------------------------------------
+# [EN] Load required packages and create output directories.
+# [ZH] 加载所需的 R 包并创建输出目录。
+# ==============================================================================
+
+library(data.table)
+library(dplyr)
+
+dir.create("data_clean", recursive = TRUE, showWarnings = FALSE)
+
+
+# ==============================================================================
+# SECTION 1: Load Datasets | 第 1 部分：读取基因表达矩阵与安全特征基因列表
+# ------------------------------------------------------------------------------
+# [EN] Load TCGA-LAML expression matrix, sample info, and the 106 safety-filtered DEGs.
+# [ZH] 读取 TCGA-LAML 表达矩阵、样本元数据以及过滤后的 106 个安全差异表达基因列表。
+# ==============================================================================
+
+cat("Loading TCGA-LAML expression matrix and sample metadata...\n")
+tcga_expr <- readRDS("data_clean/tcga_laml_expr_log2tpm.rds")
+tcga_sample_info <- read.csv("data_clean/tcga_laml_sample_info.csv", stringsAsFactors = FALSE)
+
+cat("Loading 106 safety-filtered biomarkers...\n")
+degs_filtered <- read.csv("data_clean/sig_degs_hspc_filtered.csv", stringsAsFactors = FALSE)
+
+cat("TCGA Expression matrix dims:", nrow(tcga_expr), "genes x", ncol(tcga_expr), "samples\n")
+cat("Filtered biomarkers count:", nrow(degs_filtered), "\n")
+
+
+# ==============================================================================
+# SECTION 2: Extract Expression and Perform Median-Based Grouping | 第 2 部分：提取表达值并进行中位数分组
+# ------------------------------------------------------------------------------
+# [EN] For each of the 106 genes, calculate the median expression across all samples,
+#      and classify each sample into High (>= median) or Low (< median) group.
+# [ZH] 针对 106 个基因中的每一个，计算其在所有样本中的表达量中位数，并分类为高表达组（>=中位数）或低表达组（<中位数）。
+# ==============================================================================
+
+# Align and subset expression matrix to the 106 safety-filtered genes
+common_genes <- intersect(degs_filtered$ensembl_id, rownames(tcga_expr))
+cat("Found", length(common_genes), "out of", nrow(degs_filtered), "filtered genes in the TCGA expression matrix.\n")
+
+# Subset expression matrix and map row names to Gene Symbols for readability
+expr_subset <- tcga_expr[common_genes, , drop = FALSE]
+gene_map <- setNames(degs_filtered$gene_symbol, degs_filtered$ensembl_id)
+rownames(expr_subset) <- gene_map[rownames(expr_subset)]
+
+# Transpose so that samples are rows and genes are columns
+expr_df <- as.data.frame(t(expr_subset))
+expr_df$sample_id <- rownames(expr_df)
+
+# Create an empty dataframe to store the High/Low grouping results
+# Rows: 151 TCGA samples; Columns: sample_id + 106 genes
+group_df <- data.frame(sample_id = expr_df$sample_id, stringsAsFactors = FALSE)
+
+# Loop through each gene to calculate median and assign High/Low groups
+cat("Performing median-based grouping for each gene...\n")
+for (gene in colnames(expr_df)) {
+  if (gene == "sample_id") next
+  
+  vals <- expr_df[[gene]]
+  med_val <- median(vals, na.rm = TRUE)
+  
+  # Assign High (>= median) and Low (< median)
+  group_df[[gene]] <- ifelse(vals >= med_val, "High", "Low")
+}
+
+# Preview the grouping results
+cat("\nPreview of the grouping matrix (First 5 samples and 5 genes):\n")
+print(group_df[1:5, 1:6])
+
+
+# ==============================================================================
+# SECTION 3: Save Grouping Results | 第 3 部分：保存分组结果
+# ------------------------------------------------------------------------------
+# [EN] Save the grouping results to both CSV and RDS formats in data_clean/.
+# [ZH] 将分组结果保存为 CSV 和 RDS 格式于 data_clean/ 目录。
+# ==============================================================================
+
+write.csv(group_df, file = "data_clean/tcga_laml_gene_groups.csv", row.names = FALSE)
+saveRDS(group_df, file = "data_clean/tcga_laml_gene_groups.rds")
+
+
+# ==============================================================================
+# SECTION 3: Load Survival Data and Merge | 第 3 部分：加载生存数据并合并
+# ------------------------------------------------------------------------------
+# [EN] Load TCGA-LAML clinical database, calculate overall survival time and status,
+#      and merge with the expression-based High/Low grouping results.
+# [ZH] 加载 TCGA-LAML 临床生存数据，计算生存时间与生存状态，并与高/低表达分组结果合并。
+# ==============================================================================
+
+cat("\nLoading clinical survival data...\n")
+clinical_file <- "data_raw/tcga_laml/tcga_laml_clinical.rds"
+if (!file.exists(clinical_file)) {
+  stop("Clinical data file 'data_raw/tcga_laml/tcga_laml_clinical.rds' not found. Please run scripts/01_download_tcga_laml.R first.")
+}
+tcga_clinical <- readRDS(clinical_file)
+
+# Prepare clean survival metrics
+# time: days_to_death if dead, days_to_last_follow_up if alive
+# event: 1 if dead, 0 if alive
+clinical_survival <- tcga_clinical %>%
+  mutate(
+    patient_id = submitter_id,
+    time = ifelse(vital_status == "Dead", days_to_death, days_to_last_follow_up),
+    event = ifelse(vital_status == "Dead", 1, 0)
+  ) %>%
+  filter(!is.na(time) & time > 0) %>%
+  select(patient_id, time, event)
+
+cat("Valid clinical records with survival info:", nrow(clinical_survival), "\n")
+
+# Merge grouping results with survival metadata
+# group_df has sample_id; we map to patient_id via tcga_sample_info
+merged_data <- group_df %>%
+  inner_join(tcga_sample_info[, c("sample_id", "patient_id")], by = "sample_id") %>%
+  inner_join(clinical_survival, by = "patient_id")
+
+cat("Samples aligned with expression grouping and survival data:", nrow(merged_data), "\n")
+
+# Rename hyphens to underscores in column names to prevent R formula parsing errors (e.g. for NKX2-3)
+colnames(merged_data) <- gsub("-", "_", colnames(merged_data))
+
+
+# ==============================================================================
+# SECTION 4: Perform Kaplan-Meier & Log-rank Test | 第 4 部分：执行 Kaplan-Meier 和 Log-rank 检验
+# ------------------------------------------------------------------------------
+# [EN] For each of the 106 genes, run the Log-rank test (survdiff) to evaluate
+#      whether there is a significant difference in survival between High and Low groups.
+# [ZH] 针对 106 个基因，逐一进行 Log-rank 检验，分析高/低表达组之间是否存在显著的生存时间差异。
+# ==============================================================================
+
+library(survival)
+
+cat("Running Log-rank tests for 106 safety-filtered genes...\n")
+logrank_results <- list()
+
+# Get the list of gene symbols (columns in merged_data, excluding sample_id, patient_id, time, event)
+genes_list <- setdiff(colnames(merged_data), c("sample_id", "patient_id", "time", "event"))
+
+for (gene in genes_list) {
+  # Perform log-rank test
+  # Formula: Surv(time, event) ~ gene_group
+  # No backticks needed since hyphens are replaced by underscores
+  formula_str <- paste0("Surv(time, event) ~ ", gene)
+  fit_diff <- tryCatch({
+    survdiff(as.formula(formula_str), data = merged_data)
+  }, error = function(e) {
+    NULL
+  })
+  
+  if (is.null(fit_diff)) next
+  
+  # Calculate p-value from Chi-square statistic
+  df <- length(fit_diff$n) - 1
+  p_val <- pchisq(fit_diff$chisq, df = df, lower.tail = FALSE)
+  
+  # Map name back to original symbol with hyphen for storage
+  orig_symbol <- gsub("_", "-", gene)
+  
+  logrank_results[[gene]] <- data.frame(
+    gene_symbol = orig_symbol,
+    chisq = fit_diff$chisq,
+    p_value = p_val,
+    stringsAsFactors = FALSE
+  )
+}
+
+# Bind list to dataframe and sort by p-value
+logrank_df <- do.call(rbind, logrank_results) %>%
+  arrange(p_value)
+
+# Classify significance
+logrank_df <- logrank_df %>%
+  mutate(
+    significance = ifelse(p_value < 0.05, "Significant", "Not Significant")
+  )
+
+cat("Log-rank analysis completed!\n")
+cat("Total genes analyzed:", nrow(logrank_df), "\n")
+cat("Significant prognostic genes (P < 0.05):", sum(logrank_df$p_value < 0.05), "\n")
+
+cat("\nTop 10 most prognostic genes by Log-rank P-value:\n")
+print(head(logrank_df, 10))
+
+
+# ==============================================================================
+# SECTION 5: Perform Univariate Cox Regression | 第 5 部分：执行单变量 Cox 回归分析
+# ------------------------------------------------------------------------------
+# [EN] Fit a univariate Cox proportional hazards regression model for each gene.
+#      Evaluate the Hazard Ratio (HR) of High vs Low expression group.
+# [ZH] 针对 106 个基因，逐一建立单变量 Cox 比例风险回归模型，评估高表达组相对于低表达组的风险比（HR）。
+# ==============================================================================
+
+cat("\nRunning Univariate Cox regression models...\n")
+cox_results <- list()
+
+for (gene in genes_list) {
+  # Set the reference group to 'Low' so HR represents High vs Low
+  merged_data[[gene]] <- factor(merged_data[[gene]], levels = c("Low", "High"))
+  
+  formula_str <- paste0("Surv(time, event) ~ ", gene)
+  
+  fit_cox <- tryCatch({
+    coxph(as.formula(formula_str), data = merged_data)
+  }, error = function(e) {
+    NULL
+  })
+  
+  if (is.null(fit_cox)) next
+  
+  sum_cox <- summary(fit_cox)
+  coef_info <- sum_cox$coefficients
+  conf_info <- sum_cox$conf.int
+  
+  hr_val <- coef_info[1, "exp(coef)"]
+  p_val_cox <- coef_info[1, "Pr(>|z|)"]
+  ci_lower <- conf_info[1, "lower .95"]
+  ci_upper <- conf_info[1, "upper .95"]
+  
+  # Map name back to original symbol with hyphen for storage
+  orig_symbol <- gsub("_", "-", gene)
+  
+  cox_results[[gene]] <- data.frame(
+    gene_symbol = orig_symbol,
+    coef = coef_info[1, "coef"],
+    HR = hr_val,
+    HR_CI_lower = ci_lower,
+    HR_CI_upper = ci_upper,
+    p_value = p_val_cox,
+    stringsAsFactors = FALSE
+  )
+}
+
+# Bind list to dataframe and sort by p-value
+cox_df <- do.call(rbind, cox_results) %>%
+  arrange(p_value)
+
+# Apply user's threshold: HR > 1.5 and p_value < 0.05
+cox_filtered_df <- cox_df %>%
+  filter(HR > 1.5 & p_value < 0.05)
+
+cat("Univariate Cox regression completed!\n")
+cat("Total genes analyzed:", nrow(cox_df), "\n")
+cat("Genes with HR > 1.5 & P < 0.05:", nrow(cox_filtered_df), "\n")
+
+cat("\nSignificant Prognostic Hazard Genes (HR > 1.5 & P < 0.05):\n")
+print(cox_filtered_df)
+
+
+# ==============================================================================
+# SECTION 6: Save All Results | 第 6 部分：保存分组与所有生存统计结果
+# ==============================================================================
+
+# Save grouping result
+write.csv(group_df, file = "data_clean/tcga_laml_gene_groups.csv", row.names = FALSE)
+saveRDS(group_df, file = "data_clean/tcga_laml_gene_groups.rds")
+
+# Save Log-rank stats
+write.csv(logrank_df, file = "data_clean/survival_logrank_results.csv", row.names = FALSE)
+saveRDS(logrank_df, file = "data_clean/survival_logrank_results.rds")
+
+# Save Cox regression stats
+write.csv(cox_df, file = "data_clean/survival_cox_results.csv", row.names = FALSE)
+saveRDS(cox_df, file = "data_clean/survival_cox_results.rds")
+
+# Save filtered significant hazard genes (HR > 1.5 & P < 0.05)
+write.csv(cox_filtered_df, file = "data_clean/survival_cox_sig_danger_genes.csv", row.names = FALSE)
+
+cat("\nSaved output files in data_clean/:\n")
+cat("  - tcga_laml_gene_groups.csv / .rds\n")
+cat("  - survival_logrank_results.csv / .rds\n")
+cat("  - survival_cox_results.csv / .rds\n")
+cat("  - survival_cox_sig_danger_genes.csv\n")
+
+
+# ==============================================================================
+# SECTION 7: Generate Diagnostic Visualizations | 第 7 部分：生成诊断可视化图表
+# ------------------------------------------------------------------------------
+# [EN] Generate Forest Plot for all 13 significant hazard genes, and generate
+#      Kaplan-Meier survival curves for the top 4 representative genes.
+# [ZH] 生成 13 个显著高危基因的森林图，并生成前 4 个代表性基因的 Kaplan-Meier 生存曲线合并图。
+# ==============================================================================
+
+library(ggplot2)
+
+# 1. Forest Plot for Univariate Cox results
+cat("\nGenerating Forest Plot...\n")
+plot_forest_df <- cox_filtered_df %>%
+  arrange(HR) %>%
+  mutate(gene_symbol = factor(gene_symbol, levels = gene_symbol))
+
+p_forest <- ggplot(plot_forest_df, aes(x = HR, y = gene_symbol)) +
+  geom_vline(xintercept = 1.0, linetype = "dashed", color = "darkgrey", linewidth = 0.8) +
+  geom_errorbarh(aes(xmin = HR_CI_lower, xmax = HR_CI_upper), height = 0.2, color = "black", linewidth = 0.8) +
+  geom_point(color = "#C00000", size = 3.5) +
+  theme_bw(base_size = 12) +
+  labs(
+    title = "Forest Plot of Prognostic Hazard Genes in AML",
+    subtitle = "Univariate Cox regression (HR > 1.5 & P < 0.05)",
+    x = "Hazard Ratio (HR) and 95% Confidence Interval",
+    y = "Gene Symbol"
+  ) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5, face = "italic", color = "grey30"),
+    panel.grid.minor = element_blank()
+  )
+
+ggsave("results/forest_plot_prognostic_genes.png", plot = p_forest, width = 7.5, height = 5.5, dpi = 300)
+cat("Forest Plot saved to results/forest_plot_prognostic_genes.png\n")
+
+# 2. Kaplan-Meier survival curves panels (13 genes across 4 images)
+cat("Generating KM survival curves for all 13 prognostic hazard genes (divided into 4 panels)...\n")
+library(survminer)
+
+# Sorted by p-value
+target_genes <- cox_filtered_df$gene_symbol
+plots_list <- list()
+
+for (gene in target_genes) {
+  # Clean name for formula (hyphen replaced by underscore)
+  col_gene <- gsub("-", "_", gene)
+  
+  formula_str <- paste0("Surv(time, event) ~ ", col_gene)
+  fit_gene <- survfit(as.formula(formula_str), data = merged_data)
+  
+  # Calculate exact p-value for display
+  fit_diff <- survdiff(as.formula(formula_str), data = merged_data)
+  df <- length(fit_diff$n) - 1
+  p_val <- pchisq(fit_diff$chisq, df = df, lower.tail = FALSE)
+  p_text <- ifelse(p_val < 0.001, "P < 0.001", paste0("P = ", round(p_val, 4)))
+  
+  p_km <- ggsurvplot(
+    fit_gene,
+    data = merged_data,
+    palette = c("#2E75B6", "#C00000"), # Blue for Low, Red for High
+    legend.labs = c("Low", "High"),
+    legend.title = paste0(gene, " level"),
+    title = paste0("Overall Survival: ", gene),
+    pval = p_text,
+    pval.coord = c(0, 0.1),
+    ggtheme = theme_bw(base_size = 9),
+    xlab = "Survival Time (Days)",
+    ylab = "Survival Probability",
+    risk.table = TRUE,
+    risk.table.y.text = FALSE,
+    risk.table.height = 0.23,
+    tables.theme = theme_cleantable()
+  )
+  
+  plots_list[[gene]] <- p_km
+}
+
+# Group plots into 4 panels (4 + 3 + 3 + 3 = 13 plots)
+panel_indices <- list(
+  panel1 = 1:4,
+  panel2 = 5:7,
+  panel3 = 8:10,
+  panel4 = 11:13
+)
+
+for (p_name in names(panel_indices)) {
+  indices <- panel_indices[[p_name]]
+  p_subset <- plots_list[indices]
+  
+  # Arrange plots in a 2x2 grid
+  res_grid <- arrange_ggsurvplots(
+    p_subset,
+    print = FALSE,
+    ncol = 2,
+    nrow = 2
+  )
+  
+  out_path <- paste0("results/km_curves_", p_name, ".png")
+  ggsave(out_path, plot = res_grid, width = 11, height = 9, dpi = 300)
+  cat("Saved KM curve panel to", out_path, "\n")
+}
+
+
+# ==============================================================================
+# SECTION 8: Create Week4 Folder and Copy Final Outputs | 第 8 部分：创建 Week4 目录并拷贝归档
+# ==============================================================================
+
+cat("\nCreating Week4 directory and copying final outputs...\n")
+dir.create("Week4", recursive = TRUE, showWarnings = FALSE)
+
+# Clean up any old km_curves_top_genes.png file if it exists
+if (file.exists("Week4/km_curves_top_genes.png")) {
+  file.remove("Week4/km_curves_top_genes.png")
+}
+if (file.exists("results/km_curves_top_genes.png")) {
+  file.remove("results/km_curves_top_genes.png")
+}
+
+# Copy files
+file.copy("data_clean/survival_cox_sig_danger_genes.csv", "Week4/sig_degs_survival_filtered.csv", overwrite = TRUE)
+file.copy("results/forest_plot_prognostic_genes.png", "Week4/forest_plot_prognostic_genes.png", overwrite = TRUE)
+
+for (p_name in names(panel_indices)) {
+  src <- paste0("results/km_curves_", p_name, ".png")
+  dst <- paste0("Week4/km_curves_", p_name, ".png")
+  file.copy(src, dst, overwrite = TRUE)
+}
+
+cat("Successfully copied final outputs to Week4/:\n")
+cat("  - Week4/sig_degs_survival_filtered.csv\n")
+cat("  - Week4/forest_plot_prognostic_genes.png\n")
+cat("  - Week4/km_curves_panel1.png\n")
+cat("  - Week4/km_curves_panel2.png\n")
+cat("  - Week4/km_curves_panel3.png\n")
+cat("  - Week4/km_curves_panel4.png\n")
+
+cat("\nPipeline script 07 completed successfully!\n")
+
+
+# ==============================================================================
+# SECTION 8: FUNCTIONAL ANNOTATION (GO/KEGG) & DRUGGABILITY SCORING
+# Description: Performs functional enrichment analysis using clusterProfiler and calculates a druggability scorecard, filtering out known targets to prioritize novel candidates.
+# ==============================================================================
+
+# scripts/08_pathway_enrichment.R
+
+# ==============================================================================
+# SECTION 0: Setup and Package Loading | 第 0 部分：准备与加载包
+# ==============================================================================
+
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager", repos = "https://cloud.r-project.org")
+}
+
+# Install clusterProfiler if not present
+if (!requireNamespace("clusterProfiler", quietly = TRUE)) {
+  cat("clusterProfiler not found. Installing from Bioconductor...\n")
+  options(timeout = 100000)
+  BiocManager::install("clusterProfiler", update = FALSE, ask = FALSE)
+}
+
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(dplyr)
+library(ggplot2)
+
+dir.create("results", recursive = TRUE, showWarnings = FALSE)
+dir.create("Week5", recursive = TRUE, showWarnings = FALSE)
+
+# ==============================================================================
+# SECTION 1: Load Input Genes | 第 1 部分：读取输入基因列表
+# ==============================================================================
+
+cat("Loading gene lists from Week 3 and Week 4...\n")
+degs_filtered <- read.csv("data_clean/sig_degs_hspc_filtered.csv", stringsAsFactors = FALSE)
+cox_filtered <- read.csv("data_clean/survival_cox_sig_danger_genes.csv", stringsAsFactors = FALSE)
+
+up_genes <- degs_filtered %>% filter(direction == "Up") %>% pull(gene_symbol)
+down_genes <- degs_filtered %>% filter(direction == "Down") %>% pull(gene_symbol)
+prog_genes <- cox_filtered$gene_symbol
+
+cat("Loaded:\n")
+cat("  - Safety-filtered Up-regulated genes:", length(up_genes), "\n")
+cat("  - Safety-filtered Down-regulated genes:", length(down_genes), "\n")
+cat("  - Prognostic hazard genes:", length(prog_genes), "\n")
+
+# ==============================================================================
+# SECTION 2: Entrez ID Mapping | 第 2 部分：基因名转换为 Entrez ID
+# ==============================================================================
+
+cat("\nMapping Gene Symbols to Entrez IDs using org.Hs.eg.db...\n")
+map_ids <- function(symbols) {
+  if (length(symbols) == 0) return(NULL)
+  tryCatch({
+    bitr(symbols, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+  }, error = function(e) {
+    NULL
+  })
+}
+
+ids_up <- map_ids(up_genes)
+ids_down <- map_ids(down_genes)
+ids_prog <- map_ids(prog_genes)
+
+# ==============================================================================
+# SECTION 3: Custom Enrichment Plotting Function | 第 3 部分：自定义富集分析绘图函数
+# ==============================================================================
+
+plot_enrichment_custom <- function(enrich_res, title, out_path_res, out_path_week5) {
+  if (is.null(enrich_res)) return(FALSE)
+  df <- as.data.frame(enrich_res)
+  if (nrow(df) == 0) {
+    cat("No significant terms enriched for:", title, "\n")
+    p <- ggplot() + 
+      annotate("text", x = 0.5, y = 0.5, label = paste("No significant pathways enriched\n(", title, ")", sep=""), size = 4.5, fontface = "italic") + 
+      theme_void()
+    ggsave(out_path_res, plot = p, width = 7, height = 5, dpi = 300)
+    file.copy(out_path_res, out_path_week5, overwrite = TRUE)
+    return(FALSE)
+  }
+  
+  df <- df %>% 
+    arrange(p.adjust) %>% 
+    head(15)
+  
+  df$GeneRatioVal <- sapply(df$GeneRatio, function(x) {
+    parts <- as.numeric(strsplit(x, "/")[[1]])
+    parts[1] / parts[2]
+  })
+  
+  df$Description <- sapply(df$Description, function(x) {
+    if (nchar(x) > 55) {
+      paste0(substr(x, 1, 52), "...")
+    } else {
+      x
+    }
+  })
+  
+  df$Description <- factor(df$Description, levels = rev(df$Description))
+  
+  p <- ggplot(df, aes(x = GeneRatioVal, y = Description, color = p.adjust, size = Count)) +
+    geom_point(alpha = 0.85) +
+    scale_color_gradient(low = "#C00000", high = "#2E75B6", name = "adj.P.Val") +
+    scale_size_continuous(range = c(3, 8), name = "Gene Count") +
+    theme_bw(base_size = 11) +
+    labs(
+      title = title,
+      x = "Gene Ratio (Enriched / Total)",
+      y = "Pathway / Term Description"
+    ) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 12),
+      panel.grid.minor = element_blank(),
+      axis.text.y = element_text(color = "black", size = 9),
+      axis.text.x = element_text(color = "black"),
+      legend.title = element_text(face = "bold", size = 9)
+    )
+  
+  ggsave(out_path_res, plot = p, width = 8.5, height = 6, dpi = 300)
+  file.copy(out_path_res, out_path_week5, overwrite = TRUE)
+  cat("Saved enrichment plot to:", out_path_res, "\n")
+  return(TRUE)
+}
+
+# ==============================================================================
+# SECTION 4: Run GO and KEGG Pathway Enrichment | 第 4 部分：执行 GO 和 KEGG 富集分析
+# ==============================================================================
+
+run_enrichment_analysis <- function(entrez_ids, prefix_title, file_suffix) {
+  if (is.null(entrez_ids) || nrow(entrez_ids) == 0) {
+    cat("Empty Entrez ID list for:", prefix_title, "\n")
+    return(NULL)
+  }
+  
+  cat("\n--- Running GO & KEGG for:", prefix_title, "---\n")
+  
+  # 1. GO Biological Process
+  cat("Running GO Biological Process enrichment...\n")
+  ego <- tryCatch({
+    enrichGO(
+      gene = entrez_ids$ENTREZID,
+      OrgDb = org.Hs.eg.db,
+      keyType = "ENTREZID",
+      ont = "BP",
+      pAdjustMethod = "BH",
+      pvalueCutoff = 0.05,
+      qvalueCutoff = 0.2
+    )
+  }, error = function(e) {
+    NULL
+  })
+  
+  plot_enrichment_custom(
+    ego, 
+    title = paste0(prefix_title, " GO Biological Process Enrichment"), 
+    out_path_res = paste0("results/go_enrichment_bubble_", file_suffix, ".png"),
+    out_path_week5 = paste0("Week5/go_enrichment_bubble_", file_suffix, ".png")
+  )
+  
+  if (!is.null(ego)) {
+    write.csv(as.data.frame(ego), file = paste0("data_clean/go_enrichment_results_", file_suffix, ".csv"), row.names = FALSE)
+  }
+  
+  # 2. KEGG Pathways
+  cat("Running KEGG Pathway enrichment (using tryCatch for network robustness)...\n")
+  ekegg <- tryCatch({
+    enrichKEGG(
+      gene = entrez_ids$ENTREZID,
+      organism = "hsa",
+      pAdjustMethod = "BH",
+      pvalueCutoff = 0.05,
+      qvalueCutoff = 0.2
+    )
+  }, error = function(e) {
+    cat("Warning: KEGG query failed due to network error. Skipping.\n")
+    NULL
+  })
+  
+  plot_enrichment_custom(
+    ekegg, 
+    title = paste0(prefix_title, " KEGG Pathway Enrichment"), 
+    out_path_res = paste0("results/kegg_enrichment_bubble_", file_suffix, ".png"),
+    out_path_week5 = paste0("Week5/kegg_enrichment_bubble_", file_suffix, ".png")
+  )
+  
+  if (!is.null(ekegg)) {
+    write.csv(as.data.frame(ekegg), file = paste0("data_clean/kegg_enrichment_results_", file_suffix, ".csv"), row.names = FALSE)
+  }
+}
+
+# Run for up-regulated safety-filtered genes
+run_enrichment_analysis(ids_up, "Up-regulated Safety Genes", "up")
+
+# Run for prognostic hazard genes
+run_enrichment_analysis(ids_prog, "Prognostic Hazard Genes", "prognostic")
+
+# Run for down-regulated safety-filtered genes
+run_enrichment_analysis(ids_down, "Down-regulated Safety Genes", "down")
+
+
+# ==============================================================================
+# SECTION 5: Druggability Assessment and Novel Target Screening | 第 5 部分：可靶性评估与新靶点筛选
+# ==============================================================================
+
+cat("\n======================================================================\n")
+cat("Performing Druggability Comparison and Screening...\n")
+
+# Combine all unique up-regulated candidates (from 19 safe up-regulated + 13 prognostic hazard)
+all_candidates <- unique(c(up_genes, prog_genes))
+cat("Total unique candidate genes for targeting (up-regulated in AML):", length(all_candidates), "\n")
+
+# Define the Known Target List
+known_targets <- c(
+  "CD33", "IL3RA", "FLT3", "BCL2", "IDH1", "IDH2", "KIT", "CD47", 
+  "HAVCR2", "WT1", "KMT2A", "TP53", "CD38", "NPM1"
+)
+
+# Manual subcellular localization and functional annotations for candidates
+loc_map <- list(
+  "IL1R2" = "Plasma membrane / Secreted",
+  "SLC15A3" = "Lysosomal membrane / Plasma membrane",
+  "NKX2-3" = "Nucleus",
+  "NCF1C" = "Cytoplasm",
+  "NCF1" = "Cytoplasm",
+  "VNN2" = "Plasma membrane (GPI-anchored)",
+  "CXCR1" = "Plasma membrane (GPCR)",
+  "IL3RA" = "Plasma membrane",
+  "CXCR2" = "Plasma membrane (GPCR)",
+  "CD14" = "Plasma membrane / Secreted",
+  "CMTM2" = "Plasma membrane / Transmembrane",
+  "GZMB" = "Secreted / Extracellular space",
+  "FPR2" = "Plasma membrane (GPCR)",
+  "TPSAB1" = "Secreted (Extracellular)",
+  "TPSB2" = "Secreted (Extracellular)",
+  "CLIP2" = "Cytoplasm",
+  "EGFL7" = "Secreted / Extracellular matrix",
+  "CCNA1" = "Nucleus / Cytoplasm",
+  "NRXN2" = "Plasma membrane",
+  "PDE6G" = "Cytoplasm / Membrane",
+  "CPXM1" = "Secreted (Extracellular)",
+  "C1QTNF4" = "Secreted (Extracellular)",
+  "COL24A1" = "Secreted / Extracellular matrix",
+  "MEX3B" = "Cytoplasm / Nucleus",
+  "NPW" = "Secreted (Extracellular)",
+  "MAMDC2" = "Secreted / Extracellular matrix",
+  "TRIM71" = "Cytoplasm",
+  "UMODL1" = "Plasma membrane / Secreted",
+  "IRX3" = "Nucleus"
+)
+
+# Compile comprehensive information for each candidate
+target_info_list <- list()
+
+for (gene in all_candidates) {
+  # Subcellular localization lookup
+  loc <- ifelse(!is.null(loc_map[[gene]]), loc_map[[gene]], "Unknown")
+  
+  # Novelty status
+  status <- ifelse(gene %in% known_targets, "Known Target", "Novel Candidate")
+  
+  # Check if present in Week 3 safety-filtered DEG file
+  match_deg <- degs_filtered %>% filter(gene_symbol == gene)
+  logFC_disc <- ifelse(nrow(match_deg) > 0, match_deg$logFC_discovery, NA)
+  logFC_valid <- ifelse(nrow(match_deg) > 0, match_deg$logFC_validation, NA)
+  
+  # Check if present in Week 4 prognostic file
+  match_surv <- cox_filtered %>% filter(gene_symbol == gene)
+  hr_val <- ifelse(nrow(match_surv) > 0, match_surv$HR, NA)
+  p_val <- ifelse(nrow(match_surv) > 0, match_surv$p_value, NA)
+  
+  # Determine therapeutic modality
+  modality <- "Small-molecule inhibitor"
+  if (grepl("Plasma membrane|Secreted", loc)) {
+    modality <- "Monoclonal antibody / ADC / CAR-T"
+  }
+  
+  # Calculate priority score for screening:
+  # Score starts with 0. 
+  # Membrane/Secreted gets +2 (easier to target via immune therapy).
+  # High risk in survival (HR > 1.5) gets +3.
+  # Higher logFC (logFC > 2.0) gets +1.
+  # Novel status gets +2 (academic novelty).
+  score <- 0
+  if (grepl("Plasma membrane|Secreted", loc)) score <- score + 2
+  if (!is.na(hr_val) && hr_val > 1.5) score <- score + 3
+  if (!is.na(logFC_disc) && logFC_disc > 2.0) score <- score + 1
+  if (status == "Novel Candidate") score <- score + 2
+  
+  target_info_list[[gene]] <- data.frame(
+    gene_symbol = gene,
+    subcellular_localization = loc,
+    novelty_status = status,
+    modality_category = modality,
+    logFC_discovery = logFC_disc,
+    logFC_validation = logFC_valid,
+    survival_HR = hr_val,
+    survival_p_value = p_val,
+    priority_score = score,
+    stringsAsFactors = FALSE
+  )
+}
+
+# Bind into dataframe
+all_targets_df <- do.call(rbind, target_info_list) %>%
+  arrange(desc(priority_score), desc(logFC_discovery))
+
+# Filter for Novel Candidates
+potential_novel_targets <- all_targets_df %>%
+  filter(novelty_status == "Novel Candidate")
+
+cat("Total novel candidate genes identified:", nrow(potential_novel_targets), "\n")
+cat("Displaying prioritized novel target candidates:\n")
+print(head(potential_novel_targets, 15))
+
+# Save the full target table and the filtered novel target table
+write.csv(all_targets_df, "data_clean/target_druggability_analysis.csv", row.names = FALSE)
+write.csv(potential_novel_targets, "data_clean/potential_novel_targets_list.csv", row.names = FALSE)
+write.csv(potential_novel_targets, "Week5/potential_novel_targets_list.csv", row.names = FALSE)
+
+cat("\nOutputs successfully saved to data_clean/ and Week5/:\n")
+cat("  - Week5/potential_novel_targets_list.csv\n")
+cat("  - go/kegg plots in Week5/\n")
+
+cat("\nPipeline script 08 completed successfully!\n")
+
+
+# ==============================================================================
+# SECTION 9: CROSS-DATASET VALIDATION IN LYMPHOID MALIGNANCY (DLBCL)
+# Description: Downloads GSE10846, evaluates the prognostic value of candidates in DLBCL, and classifies them into pan-hematological vs. AML-specific targets.
+# ==============================================================================
+
+# ==============================================================================
+# SECTION 0: Setup and Package Loading | 第 0 部分：准备与加载包
+# ==============================================================================
+
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager")
+}
+
+required_bioc <- c("GEOquery", "Biobase")
+required_cran <- c("data.table", "dplyr", "stringr", "survival", "ggplot2", "gridExtra")
+
+for (pkg in required_bioc) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    BiocManager::install(pkg)
+  }
+}
+
+for (pkg in required_cran) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg)
+  }
+}
+
+library(GEOquery)
+library(Biobase)
+library(data.table)
+library(dplyr)
+library(stringr)
+library(survival)
+library(ggplot2)
+library(gridExtra)
+
+# Create output directories
+dir.create("Week6", showWarnings = FALSE)
+dir.create("results", showWarnings = FALSE)
+
+# ==============================================================================
+# SECTION 1: Load and Preprocess GSE10846 Dataset | 第 1 部分：加载并预处理 GSE10846
+# ==============================================================================
+
+eset_file <- "data_raw/gse10846/gse10846_eset.rds"
+if (!file.exists(eset_file)) {
+  dir.create("data_raw/gse10846", recursive = TRUE, showWarnings = FALSE)
+  options(timeout = 100000)
+  cat("Downloading GSE10846 Series Matrix from GEO...\n")
+  gse_list <- getGEO(GEO = "GSE10846", GSEMatrix = TRUE, getGPL = FALSE, destdir = "data_raw/gse10846")
+  if ("GPL570" %in% names(gse_list)) {
+    gse10846_eset <- gse_list[["GPL570"]]
+  } else {
+    gse10846_eset <- gse_list[[1]]
+  }
+  saveRDS(gse10846_eset, file = eset_file)
+} else {
+  cat("Loading local GSE10846 ExpressionSet...\n")
+  gse10846_eset <- readRDS(eset_file)
+}
+
+gse_expr_raw <- exprs(gse10846_eset)
+gse_pheno <- pData(gse10846_eset)
+
+# Map Probes to Gene Symbols
+gpl_file <- "data_raw/gse13159/GPL570.annot.gz"
+if (!file.exists(gpl_file)) {
+  dir.create(dirname(gpl_file), recursive = TRUE, showWarnings = FALSE)
+  download.file(
+    url = "https://ftp.ncbi.nlm.nih.gov/geo/platforms/GPLnnn/GPL570/annot/GPL570.annot.gz",
+    destfile = gpl_file,
+    mode = "wb"
+  )
+}
+
+gpl_data <- parseGEO(gpl_file)
+gpl_table <- Table(gpl_data)
+
+probe_gene_info <- data.frame(
+  probe_id = as.character(gpl_table$ID),
+  gene_symbol_raw = as.character(gpl_table$`Gene symbol`),
+  stringsAsFactors = FALSE
+) %>%
+  mutate(
+    gene_symbol = str_split(gene_symbol_raw, "///", simplify = TRUE)[, 1],
+    gene_symbol = str_trim(gene_symbol)
+  ) %>%
+  filter(!is.na(gene_symbol), gene_symbol != "", gene_symbol != "---", gene_symbol != "NA")
+
+expr_dt <- as.data.table(gse_expr_raw, keep.rownames = "probe_id")
+probe_gene_dt <- as.data.table(probe_gene_info)
+expr_gene_dt <- merge(expr_dt, probe_gene_dt[, .(probe_id, gene_symbol)], by = "probe_id")
+
+sample_cols <- colnames(gse_expr_raw)
+gse_expr_by_gene <- expr_gene_dt[, lapply(.SD, mean, na.rm = TRUE), by = gene_symbol, .SDcols = sample_cols]
+
+gse_expr_clean <- as.data.frame(gse_expr_by_gene)
+rownames(gse_expr_clean) <- gse_expr_clean$gene_symbol
+gse_expr_clean$gene_symbol <- NULL
+
+# Truncate negative values and apply log2 transformation if not log scale
+expr_range <- range(gse_expr_clean, na.rm = TRUE)
+if (expr_range[2] > 100) {
+  gse_expr_clean[gse_expr_clean < 0] <- 0
+  gse_expr_final <- log2(gse_expr_clean + 1)
+} else {
+  gse_expr_final <- gse_expr_clean
+}
+
+saveRDS(gse_expr_final, file = "data_clean/gse10846_expr_clean.rds")
+
+# ==============================================================================
+# SECTION 2: Parse and Clean Phenotype Data | 第 2 部分：解析临床生存数据
+# ==============================================================================
+
+# Parse characteristics columns dynamically to avoid column offset errors
+cat("Parsing DLBCL clinical data...\n")
+parsed_clinical <- do.call(rbind, lapply(1:nrow(gse_pheno), function(i) {
+  row_text <- paste(gse_pheno[i, ], collapse = "; ")
+  status <- str_trim(str_match(row_text, "Follow up status: ([^;]+)")[, 2])
+  years <- as.numeric(str_trim(str_match(row_text, "Follow up years: ([^;]+)")[, 2]))
+  chemo <- str_trim(str_match(row_text, "Chemotherapy: ([^;]+)")[, 2])
+  diag <- str_trim(str_match(row_text, "Final microarray diagnosis: ([^;]+)")[, 2])
+  data.frame(
+    sample_id = rownames(gse_pheno)[i],
+    status = status,
+    years = years,
+    chemo = chemo,
+    diag = diag,
+    stringsAsFactors = FALSE
+  )
+}))
+
+parsed_clinical <- parsed_clinical %>%
+  mutate(
+    event = ifelse(status == "DEAD", 1, ifelse(status == "ALIVE", 0, NA))
+  )
+
+# Filter samples with valid survival data and standard chemotherapy regimens
+valid_idx <- which(!is.na(parsed_clinical$event) & !is.na(parsed_clinical$years) & 
+                     parsed_clinical$chemo %in% c("CHOP-Like Regimen", "R-CHOP-Like Regimen"))
+
+clean_expr <- gse_expr_final[, parsed_clinical$sample_id[valid_idx]]
+clean_cli <- parsed_clinical[valid_idx, ]
+clean_cli$chemo <- factor(clean_cli$chemo, levels = c("CHOP-Like Regimen", "R-CHOP-Like Regimen"))
+
+saveRDS(clean_cli, file = "data_clean/gse10846_sample_info.rds")
+
+# ==============================================================================
+# SECTION 3: Perform Survival Analysis | 第 3 部分：执行生存分析
+# ==============================================================================
+
+targets <- c("IL1R2", "VNN2", "SLC15A3", "EGFL7", "CXCR1", "CXCR2", "CD14", "GZMB", "FPR2", "CMTM2")
+dlbcl_survival_results <- list()
+
+cat("Running survival analyses for top target candidates in DLBCL...\n")
+for (g in targets) {
+  val <- as.numeric(clean_expr[g, ])
+  med <- median(val, na.rm = TRUE)
+  grp <- ifelse(val >= med, "High", "Low")
+  
+  # Aligned clinical variables
+  df_temp <- clean_cli
+  df_temp$gene_expr <- val
+  df_temp$gene_group <- factor(grp, levels = c("Low", "High"))
+  
+  # Log-rank test
+  logrank_fit <- survdiff(Surv(years, event) ~ gene_group, data = df_temp)
+  df <- length(logrank_fit$n) - 1
+  logrank_p <- pchisq(logrank_fit$chisq, df = df, lower.tail = FALSE)
+  
+  # Univariate Cox
+  uni_fit <- coxph(Surv(years, event) ~ gene_group, data = df_temp)
+  uni_summary <- summary(uni_fit)
+  uni_hr <- uni_summary$conf.int[1, 1]
+  uni_lower <- uni_summary$conf.int[1, 3]
+  uni_upper <- uni_summary$conf.int[1, 4]
+  uni_p <- uni_summary$waldtest[3]
+  
+  # Multivariate adjusted Cox (adjust for chemo regimen)
+  adj_fit <- coxph(Surv(years, event) ~ gene_group + chemo, data = df_temp)
+  adj_summary <- summary(adj_fit)
+  adj_hr <- adj_summary$conf.int[1, 1]
+  adj_lower <- adj_summary$conf.int[1, 3]
+  adj_upper <- adj_summary$conf.int[1, 4]
+  adj_p <- adj_summary$coefficients[1, 5]
+  
+  dlbcl_survival_results[[g]] <- data.frame(
+    gene_symbol = g,
+    logrank_p = logrank_p,
+    unadj_HR = uni_hr,
+    unadj_HR_lower = uni_lower,
+    unadj_HR_upper = uni_upper,
+    unadj_cox_p = uni_p,
+    adj_HR = adj_hr,
+    adj_HR_lower = adj_lower,
+    adj_HR_upper = adj_upper,
+    adj_cox_p = adj_p,
+    stringsAsFactors = FALSE
+  )
+}
+
+dlbcl_res_df <- do.call(rbind, dlbcl_survival_results)
+write.csv(dlbcl_res_df, file = "data_clean/gse10846_dlbcl_survival_results.csv", row.names = FALSE)
+write.csv(dlbcl_res_df, file = "Week6/gse10846_dlbcl_survival_results.csv", row.names = FALSE)
+
+print(dlbcl_res_df)
+
+# ==============================================================================
+# SECTION 4: Draw Kaplan-Meier Curves for Validated Targets | 第 4 部分：绘制 K-M 生存曲线
+# ==============================================================================
+
+# Custom ggplot2 KM plotting function to avoid survminer dependencies
+draw_km_ggplot <- function(gene, data, clean_expr_data) {
+  val <- as.numeric(clean_expr_data[gene, ])
+  med <- median(val, na.rm = TRUE)
+  grp <- ifelse(val >= med, "High", "Low")
+  
+  df_temp <- data
+  df_temp$gene_group <- factor(grp, levels = c("Low", "High"))
+  
+  # Fit survival curve
+  fit <- survfit(Surv(years, event) ~ gene_group, data = df_temp)
+  
+  # Compile plot dataframe
+  fit_df <- data.frame(
+    time = fit$time,
+    surv = fit$surv,
+    upper = fit$upper,
+    lower = fit$lower,
+    n.censor = fit$n.censor,
+    group = rep(names(fit$strata), fit$strata)
+  )
+  fit_df$group <- gsub("gene_group=", "", fit_df$group)
+  
+  # Extract p-value
+  p_val <- dlbcl_res_df[dlbcl_res_df$gene_symbol == gene, "logrank_p"]
+  p_text <- paste0("Log-rank P = ", format.pval(p_val, digits = 3))
+  
+  # Plot
+  p <- ggplot(fit_df, aes(x = time, y = surv, color = group)) +
+    geom_step(size = 1.2) +
+    labs(
+      title = paste0("GSE10846 (DLBCL): ", gene),
+      x = "Survival Time (Years)",
+      y = "Overall Survival Probability",
+      color = "Expression Group"
+    ) +
+    scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+    scale_color_manual(values = c("High" = "#D95F02", "Low" = "#1B9E77")) +
+    annotate("text", x = 1.5, y = 0.15, label = p_text, fontface = "italic", size = 4.5, color = "black") +
+    theme_classic() +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 13),
+      axis.title = element_text(size = 11),
+      legend.position = "bottom",
+      panel.grid.major.y = element_line(color = "gray90", linetype = "dashed")
+    )
+  return(p)
+}
+
+cat("Generating Kaplan-Meier plots for validated targets...\n")
+p_vnn2 <- draw_km_ggplot("VNN2", clean_cli, clean_expr)
+p_fpr2 <- draw_km_ggplot("FPR2", clean_cli, clean_expr)
+p_cmtm2 <- draw_km_ggplot("CMTM2", clean_cli, clean_expr)
+
+# Arrange and save as a panel
+g_km <- grid.arrange(p_vnn2, p_fpr2, p_cmtm2, ncol = 3)
+ggsave(filename = "Week6/km_curves_dlbcl_validated.png", plot = g_km, width = 12, height = 4.2, dpi = 300)
+ggsave(filename = "results/km_curves_dlbcl_validated.png", plot = g_km, width = 12, height = 4.2, dpi = 300)
+
+# ==============================================================================
+# SECTION 5: Draw Cross-Dataset HR Forest Plot | 第 5 部分：绘制跨数据集 HR 森林对比图
+# ==============================================================================
+
+# Load AML survival results
+aml_res <- read.csv("data_clean/survival_cox_results.csv") %>%
+  filter(gene_symbol %in% targets) %>%
+  select(gene_symbol, HR, HR_CI_lower, HR_CI_upper, p_value) %>%
+  mutate(Cohort = "AML (TCGA LAML)")
+
+# Clean columns and bind
+dlbcl_forest_data <- dlbcl_res_df %>%
+  select(gene_symbol, adj_HR, adj_HR_lower, adj_HR_upper, adj_cox_p) %>%
+  rename(HR = adj_HR, HR_CI_lower = adj_HR_lower, HR_CI_upper = adj_HR_upper, p_value = adj_cox_p) %>%
+  mutate(Cohort = "DLBCL (GSE10846, Adjusted)")
+
+forest_all <- rbind(aml_res, dlbcl_forest_data)
+
+# Reorder targets logically (e.g. consistently significant, AML-specific, lineage-opposing)
+forest_all$gene_symbol <- factor(forest_all$gene_symbol, levels = rev(c("CMTM2", "FPR2", "GZMB", "IL1R2", "SLC15A3", "CXCR1", "CXCR2", "CD14", "EGFL7", "VNN2")))
+
+p_forest <- ggplot(forest_all, aes(x = HR, y = gene_symbol, color = Cohort)) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "gray50") +
+  geom_errorbarh(aes(xmin = HR_CI_lower, xmax = HR_CI_upper), height = 0.3, size = 0.8, position = position_dodge(0.5)) +
+  geom_point(size = 3.5, position = position_dodge(0.5)) +
+  labs(
+    title = "Cross-Dataset Prognostic Hazard Comparison (AML vs. DLBCL)",
+    x = "Hazard Ratio (HR) with 95% CI",
+    y = "Target Candidates",
+    color = "Malignancy Cohort"
+  ) +
+  scale_color_manual(values = c("AML (TCGA LAML)" = "#E41A1C", "DLBCL (GSE10846, Adjusted)" = "#377EB8")) +
+  theme_classic() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 12),
+    axis.title = element_text(size = 10),
+    axis.text = element_text(size = 10),
+    legend.position = "right"
+  )
+
+ggsave(filename = "Week6/forest_plot_cross_dataset.png", plot = p_forest, width = 8.5, height = 5.2, dpi = 300)
+ggsave(filename = "results/forest_plot_cross_dataset.png", plot = p_forest, width = 8.5, height = 5.2, dpi = 300)
+
+cat("All validations and visualizations completed successfully!\n")
 
 
